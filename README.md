@@ -12,6 +12,55 @@ Katana SDK that most Dreamcast games were built with.
 You supply the game. Nothing here contains Sega code or data, and none is ever committed. You need
 to dump your own game legally.
 
+## About this fork
+
+This is a fork of [phobos665/dream-recomp](https://github.com/phobos665/dream-recomp), the original
+project by phobos665. The fork adds the work below, which has also been offered upstream:
+[#12](https://github.com/phobos665/dream-recomp/pull/12),
+[#13](https://github.com/phobos665/dream-recomp/pull/13) and
+[#14](https://github.com/phobos665/dream-recomp/issues/14). When those are merged, this fork follows
+upstream again. The licence is unchanged: GPL-2.0.
+
+**Titles tested on Windows 11 with an Xbox pad.** Each game's `[status]` in its `games/<id>/<id>.toml`
+records how far it gets.
+
+| Title | Status | Notes |
+|---|---|---|
+| San Francisco Rush 2049 (PAL) | Playable | Menus, memory card, races, sound. A few sky artifacts. |
+| Daytona USA 2001 (PAL) | Playable | Menus, memory card, races, sound. Some grass at the screen edge draws white or black; no shadows yet. |
+| Crazy Taxi 2 (PAL) | Playable | Menus, memory card, missions, sound. No code changes were needed. |
+| Crazy Taxi, Rez, Ikaruga | From upstream | Not re-tested here. |
+| Windows CE titles (Sega Rally 2...) | Unsupported | They boot through IP.BIN and run with the MMU on. |
+
+**What the fork adds**
+
+- Translator fixes:
+  - a hang on stores near 4 GiB;
+  - branches into delay slots;
+  - resumed functions losing their resume pc.
+- Emulation fixes:
+  - HLE fixes for the BIOS checksums Rush 2049 runs, and for GD-ROM PIO reads;
+  - video textures;
+  - per-pixel sorting of translucent polygons;
+  - audio that no longer stutters after a slow frame.
+- A settings screen for the controller and memory cards (F1 in a game).
+- `dream_launcher`: a game library window. It lists your games with their status, starts them with
+  their memory cards, and opens the same settings screen.
+
+**Playing a game here**, once the build in [docs/dev-setup.md](docs/dev-setup.md) works:
+
+1. Make the game's configuration and build its executable:
+
+   ```bash
+   .venv/Scripts/dcdisc new-game path/to/your.gdi
+   cmake --build build
+   ```
+
+   On Linux and macOS, `dcdisc` is in `.venv/bin/` instead.
+2. Run `build/launcher/dream_launcher`.
+
+Bug reports and title reports are welcome in this fork's issues.
+
 ## Core concepts
 
 **Translation happens at build time.** The translator reads the game's boot executable, decodes it
