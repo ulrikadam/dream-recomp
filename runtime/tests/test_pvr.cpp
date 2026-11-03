@@ -152,3 +152,52 @@ TEST_CASE("pvr: STARTRENDER completes on the clock; texture and frame-buffer pat
         m.write32(0x10000000u + 4 * i, i == 0 ? Rig::pcw(pvr::kEndOfList, pvr::kOpaque) : 0);
     CHECK(r.core.ta.chunks == before + 1);
 }
+
+TEST_CASE("pvr: a render draws the parameter buffer PARAM_BASE selects, not the one being filled") {
+    // Sega GT double-buffers its parameters: it fills one buffer, opens the next list in the other
+    // and then starts the render of the first. Drawing the list just opened (empty) left its menus
+    // black.
+    Rig r;
+    auto& m = r.sys.memory;
+    std::size_t drawn = 0;
+    r.core.on_render = [&](const std::vector<std::uint32_t>& s) { drawn = s.size(); };
+    m.write32(0xA05F8128u, 0x00000000u);  // TA_ISP_BASE: buffer 0
+    r.list_init();
+    r.chunk(Rig::pcw(pvr::kPolygonOrModVol, pvr::kOpaque, 0x02));
+    for (int i = 0; i < 3; ++i) r.chunk(Rig::pcw(pvr::kVertex, 0, 0, i == 2));
+    r.chunk(Rig::pcw(pvr::kEndOfList, pvr::kOpaque));
+    m.write32(0xA05F8008u, 1u);  // SOFTRESET: the TA only; what it wrote stays
+    m.write32(0xA05F8008u, 0u);
+    m.write32(0xA05F8128u, 0x00400000u);  // the next list goes to buffer 1
+    r.list_init();
+    m.write32(0xA05F8020u, 0x00000000u);  // PARAM_BASE: draw buffer 0
+    m.write32(0xA05F8014u, 1u);           // STARTRENDER
+    CHECK(drawn == 5 * 8);
+    // A title with one buffer draws what it has just filled, as before.
+    r.chunk(Rig::pcw(pvr::kEndOfList, pvr::kOpaque));
+    m.write32(0xA05F8020u, 0x00400000u);
+    m.write32(0xA05F8014u, 1u);
+    CHECK(drawn == 1 * 8);
+}
+
+TEST_CASE("pvr: a list opened twice keeps the buffer's last full list for its render") {
+    // 18 Wheeler: fill buffer 1, open buffer 0 twice (the second time empty), start sending the
+    // next list, then render buffer 1. Keeping only the list closed last kept the empty one, the
+    // list being filled was drawn instead, and its sky and HUD flickered.
+    Rig r;
+    auto& m = r.sys.memory;
+    std::size_t drawn = 0;
+    r.core.on_render = [&](const std::vector<std::uint32_t>& s) { drawn = s.size(); };
+    m.write32(0xA05F8128u, 0x00400000u);
+    r.list_init();
+    r.chunk(Rig::pcw(pvr::kPolygonOrModVol, pvr::kOpaque, 0x02));
+    for (int i = 0; i < 3; ++i) r.chunk(Rig::pcw(pvr::kVertex, 0, 0, i == 2));
+    r.chunk(Rig::pcw(pvr::kEndOfList, pvr::kOpaque));
+    m.write32(0xA05F8128u, 0x00000000u);
+    r.list_init();
+    r.list_init();
+    r.chunk(Rig::pcw(pvr::kEndOfList, pvr::kOpaque));  // the next list has begun
+    m.write32(0xA05F8020u, 0x00400000u);
+    m.write32(0xA05F8014u, 1u);
+    CHECK(drawn == 5 * 8);
+}

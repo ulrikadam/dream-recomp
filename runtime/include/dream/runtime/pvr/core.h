@@ -40,6 +40,8 @@ struct ListStats {
 class Ta {
 public:
     void reset() noexcept;
+    // The parser's state only: what the stream already holds stays (TA soft reset, list continue).
+    void reset_state() noexcept;
     void feed(const std::uint32_t words[8]);
     std::function<void(unsigned list)> on_list_end;
 
@@ -144,6 +146,12 @@ private:
     unsigned fifo_fill_ = 0;
     int render_event_ = -1;
     bool seen_ta_data_ = false;
+    // The parameter buffer the TA is filling (TA_ISP_BASE's top bits at the list init), and the
+    // last list closed in each of the sixteen buffers those bits select. A render draws the buffer
+    // PARAM_BASE selects, which a title that double-buffers its parameters keeps one list behind
+    // the TA (start_render).
+    std::uint32_t ta_buffer_ = 0;
+    std::array<std::vector<std::uint32_t>, 16> filled_;
 };
 
 }  // namespace dream::pvr

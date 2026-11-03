@@ -44,11 +44,15 @@ bool Ta::vertex_is_64(std::uint32_t pcw) noexcept {
 }
 
 void Ta::reset() noexcept {
+    reset_state();
+    stream.clear();
+}
+
+void Ta::reset_state() noexcept {
     state_ = kNs;
     current_list = 7;
     pending_v64_ = false;
     lists = {};
-    stream.clear();
 }
 
 void Ta::feed(const std::uint32_t words[8]) {
@@ -170,13 +174,26 @@ void Core::reset() {
     ta.reset();
     fifo_fill_ = 0;
     seen_ta_data_ = false;
+    ta_buffer_ = 0;
+    for (auto& s : filled_) s.clear();
 }
 
 void Core::start_render() {
     ++renders;
+    // The render reads the parameter buffer PARAM_BASE selects, not necessarily the one the TA is
+    // filling. Sega GT and 18 Wheeler fill one buffer while the other is drawn: they open the
+    // next list (18 Wheeler twice) and only then start the render of the last one. Drawing the
+    // list being filled left Sega GT's menus black and made 18 Wheeler's sky and HUD flicker, as
+    // its translucent lists were not there yet. The list being filled is drawn when the render is
+    // of its own buffer, which is what a title with one buffer does.
+    const std::uint32_t buffer = regs_[kParamBase >> 2] & 0xF00000u;
+    const std::vector<std::uint32_t>& saved = filled_[buffer >> 20];
+    const std::vector<std::uint32_t>* stream = &ta.stream;
+    if ((buffer != ta_buffer_ || ta.stream.empty()) && !saved.empty())
+        stream = &saved;
     if (on_render)
-        on_render(ta.stream);
-    const std::uint64_t cycles = render_base_cycles + render_cycles_per_word * ta.stream.size();
+        on_render(*stream);
+    const std::uint64_t cycles = render_base_cycles + render_cycles_per_word * stream->size();
     sched_.request(render_event_, cycles);
 }
 
@@ -315,18 +332,27 @@ void Core::write(std::uint32_t addr, std::uint32_t value, unsigned size) {
         case kTaListInit:
             if (value >> 31) {
                 ++list_inits;
+                // The list being closed stays renderable from its buffer (start_render). An empty
+                // one does not replace it: 18 Wheeler opens each list twice.
+                if (!ta.stream.empty())
+                    filled_[ta_buffer_ >> 20] = std::move(ta.stream);
+                ta_buffer_ = regs_[kTaIspBase >> 2] & 0xF00000u;
                 ta.reset();
                 regs_[kTaNextOpb >> 2] = regs_[kTaNextOpbInit >> 2];
                 regs_[kTaItpCurrent >> 2] = regs_[kTaIspBase >> 2];
             }
             return;
         case kTaListCont:
-            ta.reset();
+            // The next pass adds to what the earlier ones wrote.
+            ta.reset_state();
             return;
         case kSoftReset:
             regs_[off >> 2] = value;
+            // A TA reset clears its state, not the parameters already in video memory: Sega GT
+            // resets the TA after every list and then renders it, and clearing the stream drew
+            // its menus empty.
             if (value & 1u)
-                ta.reset();
+                ta.reset_state();
             return;
         case kFbRCtrl: {
             const bool changed = ((regs_[off >> 2] ^ value) >> 23) & 1u;
