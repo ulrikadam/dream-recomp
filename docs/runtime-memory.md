@@ -57,6 +57,12 @@ installs a callback that advances the scheduler to the guest's cycle count (re-e
 timers and drive status observe the present rather than the last interrupt poll. Katana's
 `syTmrGetCount` busy-waits on TMU0 between polls and gave up before the clock moved without it.
 
+**CPU writes into video memory are recorded** (2026-11-03): stores and store-queue flushes that land
+in VRAM mark their 4 KB page, in either view, and `take_vram_writes()` hands the marked pages back as
+ranges of the 64-bit view, where textures live, and clears them. The renderer drops the textures over
+those ranges before drawing (runtime-render.md, Textures). The marking is a byte per page and a flag,
+so a store costs one extra write.
+
 ## Derivation and deviations
 
 - The VRAM interleave is Flycast's `pvr_map32` (GPL-2.0, ADR 1), which matches the hardware's 64-bit

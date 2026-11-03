@@ -267,6 +267,7 @@ void DcMemory::store(std::uint32_t a, T v) {
                                sizeof(T)});
         }
         std::memcpy(t.bytes, &v, sizeof(T));
+        note_vram_store(t.bytes, sizeof(T));
         note_ram_write(a, static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<T>>(v)),
                        sizeof(T));
         return;
@@ -278,6 +279,34 @@ void DcMemory::store(std::uint32_t a, T v) {
             journal_saw_device = true;
         t.mmio->write(t.mmio_addr, static_cast<std::uint32_t>(v), sizeof(T));
     }
+}
+
+void DcMemory::note_vram_store(const std::uint8_t* p, unsigned size) noexcept {
+    const std::uint8_t* base = vram_.get();
+    if (p < base || p >= base + kVramSize)
+        return;
+    const auto first = static_cast<std::uint32_t>(p - base);
+    const std::uint32_t last = std::min<std::uint32_t>(first + size, kVramSize) - 1;
+    for (std::uint32_t page = first >> kVramPageShift; page <= last >> kVramPageShift; ++page)
+        vram_dirty_[page] = 1;
+    vram_dirty_any_ = true;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> DcMemory::take_vram_writes() {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> out;
+    if (!vram_dirty_any_)
+        return out;
+    vram_dirty_any_ = false;
+    const auto pages = static_cast<std::uint32_t>(vram_dirty_.size());
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        if (!vram_dirty_[page])
+            continue;
+        std::uint32_t end = page;
+        while (end < pages && vram_dirty_[end]) vram_dirty_[end++] = 0;
+        out.emplace_back(page << kVramPageShift, end << kVramPageShift);
+        page = end;
+    }
+    return out;
 }
 
 void DcMemory::undo_journal() {
@@ -434,6 +463,7 @@ void DcMemory::sq_flush(std::uint32_t a) {
                 journal.push_back({dest + 4 * i, old, words[i], 4});
             }
         std::memcpy(t.bytes, words, 32);
+        note_vram_store(t.bytes, 32);
         // A burst into RAM is eight stores as far as anything watching memory is concerned. Until
         // this was here the hash and the watch saw none of them.
         if (tracing_writes())

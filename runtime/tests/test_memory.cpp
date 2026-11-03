@@ -275,3 +275,28 @@ TEST_CASE("memory: a device write marks the journal as one that cannot be undone
     // The device write is not in the journal, so undoing cannot silently half-revert it.
     CHECK(m.journal.size() == 1);
 }
+
+TEST_CASE("memory: CPU stores into video memory are reported as 64-bit-view page ranges") {
+    // V-Rally 2 draws its menu text into a texture with the CPU; the texture cache has to hear of
+    // it as it hears of the TA's texture path.
+    DcMemory m;
+    CHECK(m.take_vram_writes().empty());
+    m.write32(0xA4100004u, 1u);  // 64-bit view: offset 0x100004
+    m.write16(0xA4100FFEu, 2u);  // same page
+    m.write8(0xA4103000u, 3u);   // three pages on
+    auto w = m.take_vram_writes();
+    REQUIRE(w.size() == 2);
+    CHECK(w[0].first == 0x100000u);
+    CHECK(w[0].second == 0x101000u);
+    CHECK(w[1].first == 0x103000u);
+    CHECK(w[1].second == 0x104000u);
+    CHECK(m.take_vram_writes().empty());  // taken: cleared
+    // The 32-bit view lands where the interleave puts it.
+    m.write32(0xA5000000u, 4u);
+    w = m.take_vram_writes();
+    REQUIRE(w.size() == 1);
+    CHECK(w[0].first == (DcMemory::vram_map32(0) & ~0xFFFu));
+    // Main RAM is not video memory.
+    m.write32(0x8C010000u, 5u);
+    CHECK(m.take_vram_writes().empty());
+}

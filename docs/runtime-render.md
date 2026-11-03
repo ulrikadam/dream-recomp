@@ -154,7 +154,11 @@ Worth knowing:
 The cache keys on the two words, decodes and uploads once, and hands back a descriptor set.
 Invalidation is deliberately coarse: everything is dropped when palette memory changes. Tracking
 which texels a write touched is a later optimisation, and getting it wrong shows as textures that
-never update, which is a far worse failure than decoding one again. A polygon whose texture cannot
+never update, which is a far worse failure than decoding one again. Video memory the CPU writes
+directly (stores and store-queue flushes, not the TA) is tracked in 4 KB pages
+(`DcMemory::take_vram_writes`), and the textures over those pages are dropped before each render:
+V-Rally 2 draws its menu text into a texture with the CPU, which otherwise stayed as the first
+frame it was decoded from. A polygon whose texture cannot
 be decoded draws untextured rather than not at all, because a flat shape in the right place says
 more during bring-up than a hole does.
 

@@ -242,6 +242,9 @@ struct Live {
         std::uint32_t tex_lo = 0, tex_hi = 0;
         if (pvr_.take_texture_writes(tex_lo, tex_hi))
             texture_refreshes += renderer.textures().invalidate_range(tex_lo, tex_hi, false);
+        // And what the CPU stored straight into video memory.
+        for (const auto& [lo, hi] : memory_.take_vram_writes())
+            texture_refreshes += renderer.textures().invalidate_range(lo, hi, false);
         // TEXT_CONTROL (0x5F80E4): the width of a stride texture, in units of 32 texels.
         renderer.textures().set_stride_width((pvr_.reg(0xE4) & 31u) * 32u);
         if (!offscreen.render(renderer, frame, geometry)) {

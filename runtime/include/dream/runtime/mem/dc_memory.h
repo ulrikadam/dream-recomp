@@ -247,7 +247,18 @@ public:
     // The 32-bit VRAM view interleaves the two 4 MB banks word by word onto the 64-bit view.
     static std::uint32_t vram_map32(std::uint32_t offset32) noexcept;
 
+    // Video memory the CPU stored to since the last call, as [begin, end) byte ranges in the
+    // 64-bit view (where texture addresses point), merged from 4 KB pages. V-Rally 2 draws its menu
+    // text into a texture and loads its track textures with the CPU; a texture cache that only
+    // watches the TA's texture path kept decoding what had been there before.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> take_vram_writes();
+
 private:
+    static constexpr unsigned kVramPageShift = 12;
+    void note_vram_store(const std::uint8_t* p, unsigned size) noexcept;
+    std::vector<std::uint8_t> vram_dirty_ = std::vector<std::uint8_t>(kVramSize >> kVramPageShift);
+    bool vram_dirty_any_ = false;
+
     struct Target {
         enum Kind { kNone, kBytes, kMmio } kind = kNone;
         std::uint8_t* bytes = nullptr;  // kBytes: host pointer to the first byte
