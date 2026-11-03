@@ -90,8 +90,9 @@ float fog_factor(float inv_w) {
 
 layout(location = 0) in vec4 v_base;
 layout(location = 1) in vec4 v_offset;
-layout(location = 2) in vec3 v_uv;
-layout(location = 3) in vec2 v_pos;
+layout(location = 2) in vec2 v_uv;
+layout(location = 3) noperspective in vec2 v_pos;
+layout(location = 4) noperspective in float v_inv_w;
 
 layout(location = 0) out vec4 o_colour;
 
@@ -103,9 +104,11 @@ void main() {
         if (inside != (push.clip_mode == 2))
             discard;
     }
-    const float inv_w = v_uv.z;
-    vec4 base = v_base / inv_w;
-    vec4 offset_colour = v_offset / inv_w;
+    // Colours and texture coordinates arrive perspective-corrected by the rasteriser
+    // (geometry.vert); 1/w arrives as it is in screen space.
+    const float inv_w = v_inv_w;
+    vec4 base = v_base;
+    vec4 offset_colour = v_offset;
     // "Use alpha" clear means the surface is opaque however its colours are encoded: the vertex
     // alpha is data for something else and must not reach the blender. Crazy Taxi's title logo is
     // in the translucent list with this clear on every polygon, and honouring the alpha instead
@@ -115,7 +118,7 @@ void main() {
     vec4 colour = base;
 
     if ((push.mode & 4) != 0) {
-        vec4 texel = texture(tex, v_uv.xy / inv_w);
+        vec4 texel = texture(tex, v_uv);
         if ((push.mode & 8) != 0)
             texel.a = 1.0;
         const int shading = push.mode & 3;
