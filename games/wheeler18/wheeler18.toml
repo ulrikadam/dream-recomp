@@ -1,0 +1,85 @@
+# 18WHEELER, MK-5106450
+# Written by `dcdisc new-game`. Everything here is read off the disc or is the standard Katana
+# layout; nothing from the disc itself is ever committed.
+
+[game]
+id = "wheeler18"
+title = "18WHEELER"
+region = "Europe"
+product = "MK-5106450"
+
+[disc]
+image = "disc/wheeler18.gdi"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+# Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
+# here. Run the launcher with --suggest-config FILE and it writes them for you.
+[functions]
+extra = [0x0C0520E0,
+         0x0C06FC60,
+         0x0C095700,
+         0x0C0AE6E0,
+         0x0C102440,
+         0x0C102578,
+         0x0C102CA0,
+         0x0C10D500,
+         0x0C10D6AE,
+         0x0C133960,
+         0x0C133980,
+         0x0C1379D8,
+         0x0C13F0FC,
+         0x0C1741FA,
+         0x0C174220,
+         0x0C174240,
+         0x0C17D1C0]
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C1B39F8
+size = 0x38
+dest = 0x8C000078
+
+[[relocations]]
+source = 0x0C1B39F4
+size = 0x8C
+dest = 0x8C00322C
+
+[[relocations]]
+source = 0x0C010100
+size = 0x2064
+dest = 0x8C004000
+
+[[relocations]]
+source = 0x0C1EA6D0
+size = 0x4C
+dest = 0x8C006064
+
+[[relocations]]
+source = 0x0C1B39F4
+size = 0x8C
+dest = 0x8C0071D4
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C011B68
+size = 0x44
+dest = 0x8C007BFC
+
+[[relocations]]
+source = 0x0C1B39F4
+size = 0x8C
+dest = 0x8C007DF4
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, truck select and races with sound."

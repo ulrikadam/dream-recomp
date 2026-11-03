@@ -1,0 +1,113 @@
+# CRAZY TAXI, MK-51035
+# Written by `dcdisc new-game`. Everything here is read off the disc or is the standard Katana
+# layout; nothing from the disc itself is ever committed.
+
+[game]
+id = "crazytaxipal"
+title = "CRAZY TAXI"
+region = "Europe"
+product = "MK-51035"
+
+[disc]
+image = "disc/crazytaxipal.gdi"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+# Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
+# here. Run the launcher with --suggest-config FILE and it writes them for you.
+[functions]
+extra = [0x0C087410,
+         0x0C1632CA,
+         0x0C1632D4,
+         0x0C1633B2,
+         0x0C1633CE]
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C178300
+size = 0x44
+dest = 0x8C003234
+
+[[relocations]]
+source = 0x0C010100
+size = 0xE04
+dest = 0x8C004000
+
+[[relocations]]
+source = 0x0C010F0C
+size = 0x30F4
+dest = 0x8C004E0C
+
+[[relocations]]
+source = 0x0C16DE94
+size = 0x34
+dest = 0x8C00F400
+
+[[relocations]]
+source = 0x0C16DE00
+size = 0x34
+dest = 0x8C00F500
+
+[[relocations]]
+source = 0x0C08A40C
+size = 0xE0
+dest = 0x8C00F720
+
+[[relocations]]
+source = 0x0C16DE00
+size = 0x34
+dest = 0x8C00F800
+
+[[relocations]]
+source = 0x0C16DE38
+size = 0x50
+dest = 0x8C00FA00
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C0D3B18
+size = 0xB4
+dest = 0x8C00EB90
+
+[[relocations]]
+source = 0x0C0D3A28
+size = 0xF0
+dest = 0x8C00EC44
+
+[[relocations]]
+source = 0x0C0D3974
+size = 0xB4
+dest = 0x8C00ED34
+
+[[relocations]]
+source = 0x0C0D3884
+size = 0xF0
+dest = 0x8C00EDE8
+
+[[relocations]]
+source = 0x0C0D3848
+size = 0x3C
+dest = 0x8C00EED8
+
+[[relocations]]
+source = 0x0C0D37B8
+size = 0x90
+dest = 0x8C00EF14
+
+[[relocations]]
+source = 0x0C0D3740
+size = 0x48
+dest = 0x8C00EFA4
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, memory card, play and sound."

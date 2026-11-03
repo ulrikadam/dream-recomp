@@ -1,0 +1,119 @@
+# F355 CHALLENGE, T8118D  50
+# Written by `dcdisc new-game`. Everything here is read off the disc or is the standard Katana
+# layout; nothing from the disc itself is ever committed.
+
+[game]
+id = "f355"
+title = "F355 CHALLENGE"
+region = "Europe"
+product = "T8118D  50"
+
+[disc]
+image = "disc/f355.gdi"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+# Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
+# here. Run the launcher with --suggest-config FILE and it writes them for you.
+[functions]
+extra = [0x0C0244A0,
+         0x0C0244C0,
+         0x0C024502,
+         0x0C02450E,
+         0x0C024514,
+         0x0C02451E,
+         0x0C02452E,
+         0x0C024598,
+         0x0C0245AC,
+         0x0C0245B6,
+         0x0C0245BE,
+         0x0C0245D4,
+         0x0C0245EE,
+         0x0C024600,
+         0x0C024606,
+         0x0C024728,
+         0x0C02472E,
+         0x0C024734,
+         0x0C024780,
+         0x0C024790,
+         0x0C028D64,
+         0x0C028D80,
+         0x0C028DA0,
+         0x0C02C146,
+         0x0C02C160,
+         0x0C02C166,
+         0x0C02C180,
+         0x0C02C186,
+         0x0C02C1A0,
+         0x0C02C1A8,
+         0x0C02C1C0,
+         0x0C02C1C6,
+         0x0C02C1E0,
+         0x0C02C6C4,
+         0x0C02C73E,
+         0x0C02C7C6,
+         0x0C04424E,
+         0x0C044260,
+         0x0C0442A0,
+         0x0C06218A,
+         0x0C0684C0,
+         0x0C068808,
+         0x0C068A32,
+         0x0C079EF6,
+         0x0C079F20,
+         0x0C079F60,
+         0x0C084B60,
+         0x0C094660,
+         0x0C094680,
+         0x0C094686,
+         0x0C095480,
+         0x0C097F66,
+         0x0C097FA0,
+         0x0C097FC0,
+         0x0C0EE960,
+         0x0C0EE9A0,
+         0x0C0EE9C0,
+         0x0C0F9812,
+         0x0C0F9820,
+         0x0C0F9840,
+         0x0C102480]
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C010100
+size = 0x2064
+dest = 0x8C004000
+
+[[relocations]]
+source = 0x0C15F290
+size = 0x48
+dest = 0x8C006064
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C1480D0
+size = 0x48
+dest = 0x8C007BF8
+
+[[relocations]]
+source = 0x0C15F1F8
+size = 0x30
+dest = 0x8C00B36C
+
+[[relocations]]
+source = 0x0C159B6C
+size = 0x30
+dest = 0x8C00DF88
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, memory card, races and sound. The save screen draws its help text in overlapping columns."
