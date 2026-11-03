@@ -61,6 +61,7 @@ add_library(dream::toml ALIAS dream_toml)
 add_subdirectory(render)
 add_subdirectory(audio)
 add_subdirectory(translator)
+add_subdirectory(launcher)
 # Every games/<id>/ with a CMakeLists.txt, so adding a title is adding a directory rather than
 # editing this file too. Each is a no-op without that title's extracted executable, which is every
 # checkout but the one whose owner dumped the disc.

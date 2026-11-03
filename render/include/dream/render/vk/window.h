@@ -134,6 +134,8 @@ public:
     VkRenderPass render_pass() const noexcept { return render_pass_; }
     VkFramebuffer framebuffer(std::uint32_t i) const noexcept { return framebuffers_[i]; }
     VkExtent2D extent() const noexcept { return extent_; }
+    // For what this class does not wrap, such as hiding the window while another program runs.
+    SDL_Window* sdl_window() const noexcept { return window_; }
     const std::string& error() const noexcept { return error_; }
 
 private:
