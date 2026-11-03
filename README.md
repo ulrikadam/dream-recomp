@@ -29,7 +29,11 @@ records how far it gets.
 | San Francisco Rush 2049 (PAL) | Playable | Menus, memory card, races, sound. A few sky artifacts. |
 | Daytona USA 2001 (PAL) | Playable | Menus, memory card, races, sound. Some grass at the screen edge draws white or black; no shadows yet. |
 | Crazy Taxi 2 (PAL) | Playable | Menus, memory card, missions, sound. No code changes were needed. |
-| Crazy Taxi, Rez, Ikaruga | From upstream | Not re-tested here. |
+| Crazy Taxi (PAL) | Playable | Menus, memory card, play, sound. |
+| F355 Challenge (PAL) | Playable | Menus, memory card, races, sound. The save screen's help text overlaps. |
+| Sega GT (PAL) | Playable | Intro movie, menus, a full race. |
+| 18 Wheeler: American Pro Trucker (PAL) | Playable | Menus, truck select, races. |
+| Crazy Taxi (USA), Rez, Ikaruga | From upstream | Not re-tested here. |
 | Windows CE titles (Sega Rally 2...) | Unsupported | They boot through IP.BIN and run with the MMU on. |
 
 **What the fork adds**
@@ -37,12 +41,19 @@ records how far it gets.
 - Translator fixes:
   - a hang on stores near 4 GiB;
   - branches into delay slots;
-  - resumed functions losing their resume pc.
+  - resumed functions losing their resume pc;
+  - `LDTLB`;
+  - jumps that keep the return address their function was called with (direct, through a
+    register, and back to the caller with `bra`);
+  - byte switch tables read through `extu.b`.
 - Emulation fixes:
   - HLE fixes for the BIOS checksums Rush 2049 runs, and for GD-ROM PIO reads;
   - video textures;
   - per-pixel sorting of translucent polygons;
-  - audio that no longer stutters after a slow frame.
+  - double-buffered TA parameter lists, and TA resets that keep what was sent;
+  - the interpreter leaving a run entered by a jump at its own return;
+  - audio paced on the sound device, so a slow frame no longer stutters or drops samples;
+  - a 64 MB stack for game executables on Windows.
 - A settings screen for the controller and memory cards (F1 in a game).
 - `dream_launcher`: a game library window. It lists your games with their status, starts them with
   their memory cards, and opens the same settings screen.
