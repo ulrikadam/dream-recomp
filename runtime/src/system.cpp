@@ -254,10 +254,12 @@ void System::on_untranslated(sh4::Ctx& c, ::dream::Memory& m, std::uint32_t targ
 #ifdef DREAM_DEV_INTERPRETER
     // Run the untranslated code from memory until it returns to the caller's PR (or RTEs, for an
     // exception handler), calling translated functions natively on the way.
-    const std::uint32_t return_to = c.pr;
+    const std::uint32_t return_to = sh4::take_entry_pr(c);
     c.pc = target;
     devinterp::Stats st;
-    devinterp::run(c, m, return_to, {}, &st);
+    devinterp::Options iopt;
+    iopt.leave_on_outer_return = true;  // reached by a jump, PR may be a stale return address
+    devinterp::run(c, m, return_to, iopt, &st);
     interpreter_runs += st.runs;
     interpreted_instructions += st.instructions;
     interpreter_native_calls += st.native_calls;
@@ -278,7 +280,12 @@ void System::on_resume(sh4::Ctx& c, ::dream::Memory& m, std::uint32_t pc) {
     // (which propagates to sh4::run_guest).
     c.pc = pc;
     devinterp::Stats st;
-    devinterp::run(c, m, 0xFFFFFFFFu, {}, &st);
+    // Its own return leaves the run, as a resumed translated body's does: run_guest then carries
+    // on at the address returned to, in translated code where there is some, rather than this
+    // run going on to interpret the caller and everything after it.
+    devinterp::Options iopt;
+    iopt.leave_on_outer_return = true;
+    devinterp::run(c, m, 0xFFFFFFFFu, iopt, &st);
     interpreter_runs += st.runs;
     interpreted_instructions += st.instructions;
     interpreter_native_calls += st.native_calls;

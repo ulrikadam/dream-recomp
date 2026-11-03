@@ -27,6 +27,9 @@ public:
     // Store queue: writes to 0xE0000000..0xE3FFFFFF buffer in the SQ; PREF flushes 32 bytes.
     virtual void sq_write32(std::uint32_t addr, std::uint32_t v) = 0;
     virtual void sq_flush(std::uint32_t addr) = 0;
+    // LDTLB: loads the UTLB entry MMUCR.URC selects from PTEH, PTEL and PTEA. A memory with no
+    // TLB, such as the bare harness, has nothing to load.
+    virtual void ldtlb() {}
 };
 
 // 16 MB of main RAM at every alias of area 3 (0x0C000000 physical), nothing else. Accesses outside

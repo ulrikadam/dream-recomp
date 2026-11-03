@@ -760,6 +760,9 @@ struct Machine {
                 if ((rn & 0xfc000000u) == 0xe0000000u)
                     m.sq_flush(rn);
                 break;
+            case Op::LDTLB:
+                m.ldtlb();
+                break;
             case Op::OCBI:
             case Op::OCBP:
             case Op::OCBWB:
@@ -843,8 +846,8 @@ struct Machine {
                 break;
 
             default:
-                // Delayed branches never reach here; BT/BF are handled by run(); LDTLB, the SH-4A
-                // forms and undefined words are faults, as in the emitter.
+                // Delayed branches never reach here; BT/BF are handled by run(); the SH-4A forms
+                // and undefined words are faults, as in the emitter.
                 sh4::unimplemented(c, ins.raw, pc);
         }
     }
@@ -870,6 +873,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
             return true;
         }
     };
+    unsigned depth = 0;  // interpreted calls not yet returned from, for leave_on_outer_return
     for (;;) {
         if (opt.max_instructions && st.instructions >= opt.max_instructions)
             return Stop::StepLimit;
@@ -1013,11 +1017,21 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                     }
                 }
                 c.pc = t;  // interpret the callee; its RTS comes back through PR
+                ++depth;
                 break;
             case Flow::Ret:
                 sh4::trace_return(c, m, pc);
-                if (t == return_to)
+                if (opt.leave_on_outer_return) {
+                    if (depth == 0) {
+                        if (t == return_to)
+                            return Stop::Returned;
+                        c.pc = pc;
+                        sh4::nonlocal_return(c, m, t);  // throws to sh4::run_guest
+                    }
+                    --depth;
+                } else if (t == return_to) {
                     return Stop::Returned;
+                }
                 c.pc = t;
                 mc.poll();
                 break;

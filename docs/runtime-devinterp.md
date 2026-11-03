@@ -131,7 +131,8 @@ become load-bearing).
 - Cycle counts are one per instruction, as in emitted code; no per-opcode timing.
 - A handler that never returns (a longjmp-style task switch) is not modelled, the same limit as the
   cooperative delivery model in WP2.2.
-- `LDTLB` and the SH-4A-only forms fault, as they do in emitted code.
+- `LDTLB` loads the UTLB entry MMUCR.URC selects (`Memory::ldtlb`), as emitted code does; the
+  SH-4A-only forms fault, as they do in emitted code.
 
 ## Isolating a bug to a function (2026-09-13)
 

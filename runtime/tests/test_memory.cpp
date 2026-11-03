@@ -155,6 +155,27 @@ TEST_CASE("memory: with the MMU on, store queues flush through the UTLB, not QAC
     CHECK(m.faults().total() == 0);
 }
 
+TEST_CASE("memory: LDTLB loads the entry MMUCR.URC selects from PTEH, PTEL and PTEA") {
+    // The startup stub of 18 Wheeler and F355 Challenge maps its store-queue page this way.
+    DcMemory m;
+    m.write32(0xFF000000u, 0xE0000000u | 0x12u);   // PTEH: VPN, ASID
+    m.write32(0xFF000004u, 0x0C100000u | 0x1BEu);  // PTEL: PPN, V, 1 MB, PR, C, D, SH
+    m.write32(0xFF000034u, 0x5u);                  // PTEA: TC, SA
+    m.write32(0xFF000010u, (5u << 10) | 1u);       // MMUCR: URC 5, AT
+    m.ldtlb();
+    CHECK(m.read32(0xF6000500u) == (0xE0000000u | 0x200u | 0x100u | 0x12u));  // VPN, D, V, ASID
+    CHECK(m.read32(0xF7000500u) == (0x0C100000u | 0x1BEu));
+    CHECK(m.read32(0xF7800500u) == 0x5u);
+    CHECK(m.read32(0xF6000000u) == 0u);  // entry 0 untouched
+
+    // The entry translates: a store-queue burst lands in RAM through it.
+    for (std::uint32_t i = 0; i < 8; ++i) m.sq_write32(0xE0000000u + 4 * i, 0x700u + i);
+    m.sq_flush(0xE0000040u);
+    CHECK(m.read32(0x8C100040u) == 0x700u);
+    CHECK(m.sq_tlb_flushes == 1);
+    CHECK(m.faults().total() == 0);
+}
+
 TEST_CASE("memory: MMIO dispatch hands physical addresses and sizes to the device") {
     DcMemory m;
     Recorder holly, tmu;

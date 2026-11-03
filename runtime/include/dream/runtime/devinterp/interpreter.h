@@ -26,6 +26,14 @@ struct Options {
     // A non-local return thrown by natively called code is caught and interpreting continues at
     // its target (the harness); off, it propagates to sh4::run_guest (the runtime).
     bool catch_nonlocal = false;
+    // An RTS at the level the run started at that goes anywhere but `return_to` leaves the run as
+    // a non-local return (sh4::nonlocal_return), as an RTS to a PR other than the entry PR does in
+    // translated code. For runs entered from translated code: a jmp or braf there is a tail call,
+    // and PR may still hold the return address of a call made earlier in the same function, so
+    // the code's own RTS (to the PR it pops) never matches `return_to`. Without this the run went
+    // on interpreting the caller's code, nested, until the stack no longer matched the host
+    // frames (18 Wheeler, at a byte-table switch the translator did not recover).
+    bool leave_on_outer_return = false;
     std::uint64_t max_instructions = 0;  // 0 = unlimited
 };
 

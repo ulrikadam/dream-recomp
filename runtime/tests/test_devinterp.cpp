@@ -128,6 +128,34 @@ TEST_CASE("devinterp: the step limit stops a runaway loop") {
     sh4::set_hooks(nullptr);
 }
 
+TEST_CASE("devinterp: entered by a jump, an outer RTS elsewhere leaves as a non-local return") {
+    // Translated code reached this with a jmp after an earlier call left PR stale, so return_to
+    // is not where the code goes back to: its own epilogue pops the real return address. An
+    // inner bsr/rts pair stays inside the run.
+    System sys;
+    sys.install();
+    auto& c = sys.ctx;
+    // bsr +6 ; nop ; lds.l @r15+,pr ; rts ; add #1,r0     callee: rts ; add #10,r0
+    put(sys.memory, 0x8C020000u, {0xB006u, 0x0009u, 0x4F26u, 0x000Bu, 0x7001u});
+    put(sys.memory, 0x8C020010u, {0x000Bu, 0x700Au});
+    c.r[15] = 0x8C00F000u;
+    sys.memory.write32(0x8C00F000u, 0x8C030200u);
+    c.r[0] = 0;
+    c.pc = 0x8C020000u;
+    devinterp::Options opt;
+    opt.leave_on_outer_return = true;
+    std::uint32_t left_to = 0;
+    try {
+        devinterp::run(c, sys.memory, 0x8C0300F0u, opt, nullptr);
+    } catch (const sh4::NonLocalReturn& n) {
+        left_to = n.pc;
+    }
+    CHECK(left_to == 0x8C030200u);
+    CHECK(c.r[0] == 11u);  // both delay slots ran, the inner return did not end the run
+    CHECK(c.r[15] == 0x8C00F004u);
+    sh4::set_hooks(nullptr);
+}
+
 #else
 
 TEST_CASE("release: an untranslated target is recorded and fatal") {

@@ -36,7 +36,8 @@ manual 4.6). Katana's Shinobi does this when a title turns the MMU on: `sySqInit
 entries from 0xE0000000 onto RAM and from 0xE1000000 onto the TA FIFO through the UTLB arrays, and
 leaves QACR at 0. Ikaruga's display lists and textures all go this way; without the translation they
 landed at 0x01000000 and the title waited forever for a texture transfer. The arrays store what is
-written, MMUCR.TI clears the valid bits, and `translate` honours the 1 KB, 4 KB, 64 KB and 1 MB page
+written, LDTLB loads the entry MMUCR.URC selects from PTEH, PTEL and PTEA (the startup stub of
+18 Wheeler and F355 Challenge maps its pages this way), MMUCR.TI clears the valid bits, and `translate` honours the 1 KB, 4 KB, 64 KB and 1 MB page
 sizes without comparing ASIDs. A flush that no entry maps raises a TLB miss on hardware; here it
 takes the QACR route and counts in `sq_tlb_misses`, which the launcher's report prints. Ordinary
 loads and stores are not translated.

@@ -335,6 +335,13 @@ void call_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target) {
     throw std::runtime_error("untranslated call target " + hex(target) + " from pc " + hex(c.pc));
 }
 
+void tail_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target, std::uint32_t cont) {
+    c.tail_pr = cont;
+    c.tail_pending = 1;
+    call_indirect(c, m, target);
+    c.tail_pending = 0;  // a target with no entry to read it (an HLE hook) leaves it set
+}
+
 void deliver_irq(Ctx& c, ::dream::Memory& m) {
     if (g_hooks) {
         g_hooks->on_poll(c, m);

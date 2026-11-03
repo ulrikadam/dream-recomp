@@ -101,6 +101,14 @@ bool Utlb::translate(std::uint32_t va, std::uint32_t& pa) const noexcept {
     return false;
 }
 
+void Utlb::load(unsigned i, std::uint32_t pteh, std::uint32_t ptel, std::uint32_t ptea) noexcept {
+    i &= 63;
+    // The address array holds PTEH's VPN and ASID with PTEL's V bit, and its D bit one place up.
+    addr_[i] = (pteh & 0xFFFFFCFFu) | (ptel & kValid) | ((ptel & 4u) << 7);
+    data1_[i] = ptel & 0x1FFFFDFFu;  // PTEL is laid out as data array 1
+    data2_[i] = ptea & 0xFu;
+}
+
 void Utlb::invalidate() noexcept {
     for (unsigned i = 0; i < 64; ++i) {
         addr_[i] &= ~kValid;
@@ -397,6 +405,13 @@ void DcMemory::sq_write32(std::uint32_t a, std::uint32_t v) {
 // With MMUCR.AT set the UTLB maps Rn instead and QACR is not used. A miss raises a TLB miss on
 // hardware; here the burst takes the QACR route and is counted, so a title that depends on the
 // exception shows in the report instead of faulting.
+// LDTLB loads the UTLB entry MMUCR.URC (bits 15..10) selects from PTEH, PTEL and PTEA (SH7750
+// manual 3.7). Katana's startup stub in 18 Wheeler and F355 Challenge maps its store-queue pages
+// this way instead of through the arrays.
+void DcMemory::ldtlb() {
+    utlb_.load((ccn_[4] >> 10) & 63u, ccn_[0], ccn_[1], ccn_[0x34 / 4]);
+}
+
 void DcMemory::sq_flush(std::uint32_t a) {
     const unsigned n = (a >> 5) & 1;
     std::uint32_t dest = (qacr_[n] << 24) | (a & 0x03FFFFE0u);

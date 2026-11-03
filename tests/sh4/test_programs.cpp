@@ -259,6 +259,35 @@ TEST_CASE("p14_slotjoin: entering a jmp's slot carries on after the pair") {
     }
 }
 
+// A bra to the address the caller continues at is a return (Katana's exception stub in 18 Wheeler
+// and F355 Challenge comes back from its dispatcher this way). As a tail call, the caller's
+// continuation ran here and then again when the call returned.
+TEST_CASE("p15_braret: a branch to the caller's continuation returns") {
+    dream::BareMemory m;
+    load_image(m, "p15_braret.bin", 0x8C050000);
+    for (std::uint32_t pr : {0x8C050000u, 0x0C050000u}) {  // P1, or the same RAM through P0
+        Ctx c = fresh();
+        c.pr = pr;  // as the caller's jsr left it: _brcont is the code after that jsr
+        c.r[4] = 1;
+        c.r[5] = 10;
+        dream::gen::brback(c, m);
+        CHECK(c.r[4] == 11u);  // the slot ran
+        CHECK(c.r[5] == 10u);  // the continuation did not: the caller runs it once
+    }
+    {
+        Ctx c = fresh();
+        c.pr = 0x8C0500F0u;  // somewhere else: the branch is a jump into _brcont
+        c.r[15] = 0x8C020000u;
+        m.write32(0x8C020000u, 0x8C0500F0u);  // the PR _brcont pops
+        c.r[4] = 1;
+        c.r[5] = 10;
+        dream::gen::brback(c, m);
+        CHECK(c.r[5] == 11u);
+        CHECK(c.r[0] == 11u);
+        CHECK(c.r[15] == 0x8C020004u);
+    }
+}
+
 // A resume entry polls for interrupts before it dispatches, and an interrupt taken there has to
 // see the pc being resumed: a handler that switches tasks saves that pc as the task's SPC, and the
 // task carries on from it when it is switched back. Recording the function's entry instead sent

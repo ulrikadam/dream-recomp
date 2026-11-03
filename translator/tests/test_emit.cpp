@@ -39,6 +39,14 @@ TEST_CASE("emit: a store just below 4 GB does not stall the patched-literal scan
     CHECK(r.source.find("topstore") != std::string::npos);
 }
 
+TEST_CASE("emit: LDTLB is lowered to the memory's TLB load, not left to fault") {
+    // ldtlb / rts / nop: the Katana startup stub in 18 Wheeler and F355 Challenge.
+    const Image img = image_of(0x0C010000, {0x0038, 0x000B, 0x0009});
+    const auto r = emit_unit(img, {FunctionSpec{img.base, img.base + 6, "maptlb"}}, EmitOptions{});
+    CHECK(r.unlowered == 0);
+    CHECK(r.source.find("m.ldtlb();") != std::string::npos);
+}
+
 TEST_CASE("emit: a store into the image's own pool is still found") {
     // mov.l @(4,pc),r1 (the pool word at +8) / mov.l r0,@r1 / rts / nop / pool: base + 8
     const std::uint32_t base = 0x0C010000, pool = base + 8;
@@ -64,4 +72,15 @@ TEST_CASE("discover: a branch into a delay slot carries on after the branch pair
     REQUIRE(!r.functions.empty());
     CHECK(r.functions.front().entry == base);
     CHECK(r.functions.front().end == base + 0x12);  // through the rts and its slot
+}
+
+TEST_CASE("emit: a jump through a register hands on the entry PR, which entries take") {
+    // `jmp @r3 ; nop`: 18 Wheeler jumps to a routine that ends with rts after putting an
+    // epilogue's address in PR. The routine has to check its rts against this function's entry
+    // PR, not against PR, or the rts to the epilogue looks like an ordinary return.
+    const Image img = image_of(0x0C010000, {0x432B, 0x0009});
+    const auto r = emit_unit(img, {FunctionSpec{img.base, img.base + 4, "jumper"}}, EmitOptions{});
+    CHECK(r.source.find("tail_indirect(c, m, target, resume_pc ? c.pr : entry_pr)") !=
+          std::string::npos);
+    CHECK(r.source.find("jumper__body(c, m, resume_pc, take_entry_pr(c))") != std::string::npos);
 }

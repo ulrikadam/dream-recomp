@@ -245,9 +245,12 @@ public:
         // The body is the resume entry (docs/emitter-design.md, "Non-local returns"): entered with
         // resume_pc = 0 by the plain function, or at a block start / call-return address after a
         // non-local return. entry_pr is what an `rts` must return to; anything else is a non-local
-        // return.
-        out << "static void " << name << "__resume(Ctx& c, Memory& m, std::uint32_t resume_pc) {\n";
-        out << "    [[maybe_unused]] const std::uint32_t entry_pr = c.pr;\n";
+        // return. A call passes the PR it just set; a jump from another function of this unit
+        // passes that function's own entry_pr (tail_target_expr), since a jump does not change
+        // where control returns to while PR may still hold a call made before it.
+        out << "static void " << name
+            << "__body(Ctx& c, Memory& m, std::uint32_t resume_pc, "
+               "[[maybe_unused]] std::uint32_t entry_pr) {\n";
         // Poll points record the exact guest pc first: an interrupt handler that switches tasks
         // returns through RTE to SPC, and run_guest re-enters this function there. On a resume
         // that pc is resume_pc, not the entry: recording the entry restarts the function with the
@@ -285,20 +288,22 @@ public:
                         // landing one instruction into a prologue, or shared code): control
                         // continues in that function, so tail-call it.
                         out << "    // falls through into the function at " << hex(stop) << "\n";
-                        out << "    " << call_target_expr(stop) << " return;\n";
+                        out << "    " << tail_target_expr(stop) << " return;\n";
                     } else {
                         // Control continues at `stop`, which no function of this unit starts at:
                         // hand it to the runtime (the miss handler interprets it in dev builds
                         // and it shows up in the untranslated-target log either way).
                         out << "    // falls off the end of the function range at " << hex(stop)
                             << "\n";
-                        out << "    c.pc = " << hexu(stop) << "; call_indirect(c, m, " << hexu(stop)
-                            << "); return;\n";
+                        out << "    c.pc = " << hexu(stop) << "; " << tail_target_expr(stop)
+                            << " return;\n";
                     }
                 }
             }
         }
         out << "}\n";
+        out << "static void " << name << "__resume(Ctx& c, Memory& m, std::uint32_t resume_pc) { "
+            << name << "__body(c, m, resume_pc, take_entry_pr(c)); }\n";
         out << "void " << name << "(Ctx& c, Memory& m) { ";
         if (opt_.replay_hooks) {
             // The mode this function was compiled for travels with the hook, so a development run
@@ -868,6 +873,33 @@ private:
         return "call_indirect(c, m, " + hexu(target) + ");";
     }
 
+    // A branch out of the function to the address its caller continues at is a return, as an RTS
+    // to the entry PR is: the caller's code after the call is that address. Katana's exception
+    // stub (18 Wheeler, F355 Challenge) calls a dispatcher with jsr, and the dispatcher comes back
+    // with a bra to the instruction after the jsr. As a tail call, that code ran twice -- from the
+    // bra, then again when the call returned -- and the second pass restored a context already
+    // gone (RTE to pc 0). Addresses are compared without their area bits, since the caller may be
+    // the interpreter using the P1 address of relocated code.
+    std::string leave_expr(std::uint32_t target) const {
+        return "if (!resume_pc && ((entry_pr ^ " + hexu(target) +
+               ") & 0x1fffffffu) == 0) return; " + tail_target_expr(target) + " return;";
+    }
+
+    // A jump to `target`, which returns where this function would have. A function of this unit
+    // gets this function's entry_pr rather than reading PR, which a call made earlier in this
+    // function may have left pointing back into it: every RTS after such a jump then looked
+    // non-local, and F355 Challenge took a C++ exception for each, 1,300 a frame while loading.
+    // A resumed body has no entry_pr of its own and passes PR as before. Anywhere else, the
+    // runtime hands it over (tail_indirect).
+    std::string tail_target_expr(std::uint32_t target) const {
+        auto it = known_.find(normalise(target));
+        if (it != known_.end())
+            return it->second + "__body(c, m, 0, " + kTailPr + ");";
+        return "tail_indirect(c, m, " + hexu(target) + ", " + kTailPr + ");";
+    }
+    // What a jump out of this function passes on as the return address (see tail_target_expr).
+    static constexpr const char* kTailPr = "resume_pc ? c.pr : entry_pr";
+
     std::string irq_check_if_backedge(std::uint32_t target, std::uint32_t pc) const {
         // Braced: GCC's -Wmisleading-indentation rejects `if (x) f(); goto L;` on one line.
         return (opt_.irq_checks && target <= pc)
@@ -896,8 +928,7 @@ private:
                 out << "    if (" << cond << ") { c.cycles += 1; " << irq_check_if_backedge(t, pc)
                     << "goto " << label(t) << "; }\n";
             } else {
-                out << "    if (" << cond << ") { c.cycles += 1; " << call_target_expr(t)
-                    << " return; }\n";
+                out << "    if (" << cond << ") { c.cycles += 1; " << leave_expr(t) << " }\n";
             }
             return pc + 2;
         }
@@ -934,7 +965,7 @@ private:
                     out << "        if (taken) { " << irq_check_if_backedge(t, pc) << "goto "
                         << label(t) << "; }\n";
                 } else {
-                    out << "        if (taken) { " << call_target_expr(t) << " return; }\n";
+                    out << "        if (taken) { " << leave_expr(t) << " }\n";
                 }
                 break;
             }
@@ -945,7 +976,7 @@ private:
                     out << "        " << irq_check_if_backedge(t, pc) << "goto " << label(t)
                         << ";\n";
                 } else {
-                    out << "        " << call_target_expr(t) << " return;\n";
+                    out << "        " << leave_expr(t) << "\n";
                 }
                 break;
             }
@@ -1006,14 +1037,14 @@ private:
                             << irq_check_if_backedge(t, pc) << "goto " << label(t) << ";\n";
                     }
                     out << "            default: c.pc = " << hexu(pc)
-                        << "; call_indirect(c, m, target); return;\n";
+                        << "; tail_indirect(c, m, target, " << kTailPr << "); return;\n";
                     out << "        }\n";
                 } else {
                     if (ins.op == Op::BRAF)
                         note(pc, ins,
                              "computed jump with no recovered table: emitted as tail call");
-                    out << "        c.pc = " << hexu(pc)
-                        << "; call_indirect(c, m, target); return;\n";
+                    out << "        c.pc = " << hexu(pc) << "; tail_indirect(c, m, target, "
+                        << kTailPr << "); return;\n";
                 }
                 break;
             }
@@ -1061,7 +1092,7 @@ private:
             if (blocks_.count(pc + 4))
                 out << "    goto " << label(pc + 4) << ";\n";
             else if (!in_range(pc + 4))
-                out << "    c.pc = " << hexu(pc + 4) << "; " << call_target_expr(pc + 4)
+                out << "    c.pc = " << hexu(pc + 4) << "; " << tail_target_expr(pc + 4)
                     << " return;\n";
         }
         if (call_returns_.count(pc + 4) && !blocks_.count(pc + 4))
@@ -1593,6 +1624,8 @@ private:
             case Op::PREF:
                 return "if ((" + rn + " & 0xfc000000u) == 0xe0000000u) m.sq_flush(" + rn +
                        "); /* else cache hint */";
+            case Op::LDTLB:
+                return "m.ldtlb();";
             case Op::OCBI:
             case Op::OCBP:
             case Op::OCBWB:
@@ -1702,6 +1735,8 @@ EmitResult emit_unit(const Image& image, const std::vector<FunctionSpec>& functi
         src << "void " << f.name << "(Ctx& c, Memory& m);\n";
         src << "static void " << f.name
             << "__resume(Ctx& c, Memory& m, std::uint32_t resume_pc);\n";
+        src << "static void " << f.name
+            << "__body(Ctx& c, Memory& m, std::uint32_t resume_pc, std::uint32_t entry_pr);\n";
     }
     src << "\n";
     // Pass 0: pool words the unit itself writes (run-time patched literals) are never folded.

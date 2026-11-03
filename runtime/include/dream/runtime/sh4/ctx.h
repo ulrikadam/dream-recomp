@@ -40,9 +40,15 @@ struct Ctx {
     // calls deliver_irq, which runs the scheduler up to `cycles`, delivers interrupts, and sets the
     // next deadline. The bare harness sets it to UINT64_MAX on the first poll.
     std::uint64_t next_event;
+    // A jump through a register hands its target the return address the jumping function was
+    // called with (tail_indirect), which PR need not hold: PR may still point back into the
+    // jumping function after a call, or hold an address the code put there on purpose. Read and
+    // cleared by the next function entry (take_entry_pr).
+    std::uint32_t tail_pr;
+    std::uint32_t tail_pending;
 };
 
-static_assert(sizeof(Ctx) == 4 * (16 + 8 + 16) + 4 * 32 + 8,
+static_assert(sizeof(Ctx) == 4 * (16 + 8 + 16) + 4 * 32 + 8 + 8,
               "Ctx layout changed; update emitter and harness");
 
 // SR bit positions.

@@ -53,6 +53,21 @@ void set_interpret_functions(const std::vector<std::pair<std::uint32_t, std::uin
 
 // Control transfers whose target is only known at run time.
 void call_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target);
+// A jump through a register out of a function (jmp, braf, a branch out of the unit): `cont` is
+// where the jumping function's caller continues, and so where the target returns to by ending.
+// 18 Wheeler puts the address of an epilogue in PR and jumps to a routine that ends with rts:
+// read from PR, the routine's entry PR made that rts look like an ordinary return, and the
+// epilogue never ran.
+void tail_indirect(Ctx& c, ::dream::Memory& m, std::uint32_t target, std::uint32_t cont);
+// The return address a function entered now checks its RTS against: the one tail_indirect handed
+// over, else PR. Every translated function reads it once, at entry.
+inline std::uint32_t take_entry_pr(Ctx& c) noexcept {
+    if (c.tail_pending) {
+        c.tail_pending = 0;
+        return c.tail_pr;
+    }
+    return c.pr;
+}
 
 // Non-local returns (docs/emitter-design.md, "Non-local returns"). Emitted code calls
 // nonlocal_return from an `rts` whose target is not its entry PR; it throws NonLocalReturn.

@@ -77,6 +77,8 @@ public:
     // The physical address a valid entry maps va to, or false when none does.
     bool translate(std::uint32_t va, std::uint32_t& pa) const noexcept;
     void invalidate() noexcept;  // MMUCR.TI
+    // What LDTLB does: entry `i` (MMUCR.URC) from PTEH, PTEL and PTEA.
+    void load(unsigned i, std::uint32_t pteh, std::uint32_t ptel, std::uint32_t ptea) noexcept;
     // Address-array writes with the associative bit set, which compare instead of index. Not
     // modelled; counted so a title that relies on them shows up.
     std::uint64_t associative_writes = 0;
@@ -240,6 +242,7 @@ public:
     void write64(std::uint32_t a, std::uint64_t v) override;
     void sq_write32(std::uint32_t a, std::uint32_t v) override;
     void sq_flush(std::uint32_t a) override;
+    void ldtlb() override;
 
     // The 32-bit VRAM view interleaves the two 4 MB banks word by word onto the 64-bit view.
     static std::uint32_t vram_map32(std::uint32_t offset32) noexcept;
