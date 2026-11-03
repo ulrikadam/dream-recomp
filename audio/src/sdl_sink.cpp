@@ -46,6 +46,11 @@ void Sink::close() {
     block_.clear();
 }
 
+void Sink::wait_below(unsigned frames, unsigned max_ms) const {
+    const Uint64 end = SDL_GetTicksNS() + Uint64{max_ms} * 1000000u;
+    while (queued_samples() > frames && SDL_GetTicksNS() < end) SDL_DelayPrecise(500000);  // 0.5 ms
+}
+
 unsigned Sink::queued_samples() const {
     if (!stream_)
         return 0;

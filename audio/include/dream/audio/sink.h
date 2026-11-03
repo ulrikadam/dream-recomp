@@ -48,6 +48,12 @@ public:
     // in step with the picture. At 8192 the cushion pushed a catching-up guest over the mark and
     // Daytona USA 2001 dropped eighteen blocks in a race.
     unsigned high_water = 12288;
+    // Where a windowed run keeps the queue when the device paces it (about 93 ms at 44.1 kHz): a
+    // frame up to that slow is not heard, and sound trails the picture by no more than that.
+    static constexpr unsigned kPaceFrames = 4096;
+    // Waits until the device holds no more than `frames`, or for at most `max_ms`. With SDL's
+    // precise delay: the C++ sleep rounds up to the 15.6 ms system tick on Windows, a whole frame.
+    void wait_below(unsigned frames, unsigned max_ms) const;
 
     // starved: blocks that found the device's queue already empty, so it had gone silent before
     // they arrived. Each is an audible gap: the guest fell behind real time for that long.

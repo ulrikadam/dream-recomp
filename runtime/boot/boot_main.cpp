@@ -8,6 +8,7 @@
 // Exit code 0 when the run reached the requested stop (the first TA FIFO write with --stop-on-ta,
 // otherwise the frame or time limit), 1 on a fault, 2 on a setup error.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -1975,8 +1976,78 @@ int main(int argc, char** argv) {
         }
         std::fprintf(record_file, "# frame buttons rtrigger ltrigger joy_x joy_y joy2_x joy2_y\n");
     }
+    // DREAM_SLOW_FRAMES=ms: every frame that took longer than that on the host, with what the
+    // guest did during it, to tell a slow frame's cause (a disc read, the interpreter, a memory
+    // card write, a heavy display list) from the frames around it.
+    // DREAM_SAMPLE_PC=1: a thread reads the guest's PC and PR every millisecond and the hottest
+    // pairs are printed at exit. Translated code stores PC at calls and polls, not per
+    // instruction, so a sample names the last call site: coarse, but enough to say which code a
+    // slow stretch is spent in. The reads race the guest on purpose; this is a diagnostic.
+    struct PcSampler {
+        std::atomic<bool> stop{false};
+        std::unordered_map<std::uint64_t, std::uint64_t> hits;
+        std::thread worker;
+        ~PcSampler() {
+            if (!worker.joinable())
+                return;
+            stop = true;
+            worker.join();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> v(hits.begin(), hits.end());
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+            std::fprintf(stderr, "pc samples (pc pr count):\n");
+            for (std::size_t i = 0; i < v.size() && i < 20; ++i)
+                std::fprintf(stderr, "  %08x %08x %llu\n", static_cast<unsigned>(v[i].first >> 32),
+                             static_cast<unsigned>(v[i].first),
+                             static_cast<unsigned long long>(v[i].second));
+        }
+    } pc_sampler;
+    if (std::getenv("DREAM_SAMPLE_PC")) {
+        pc_sampler.worker = std::thread([&] {
+            while (!pc_sampler.stop) {
+                const volatile dream::sh4::Ctx& vc = sys.ctx;
+                ++pc_sampler.hits[std::uint64_t{vc.pc} << 32 | vc.pr];
+                // Spun rather than slept: a sleep is a 15.6 ms tick on Windows.
+                const auto until =
+                    std::chrono::steady_clock::now() + std::chrono::microseconds(250);
+                while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
+            }
+        });
+    }
+    const char* slow_env = std::getenv("DREAM_SLOW_FRAMES");
+    const double slow_ms = slow_env ? std::atof(slow_env) : 0.0;
+    struct SlowMark {
+        std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+        std::uint64_t sectors = 0, interp = 0, card = 0, lcd = 0, chunks = 0, gd = 0;
+    } slow_mark;
     sys.spg.on_vblank_out = [&] {
         const std::uint64_t f = sys.spg.frames();
+        if (slow_ms > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(now - slow_mark.at).count();
+            std::uint64_t gd = 0;
+            for (const auto& [k, v] : bios.counts)
+                if (k.rfind("gdrom", 0) == 0)
+                    gd += v;
+            SlowMark next{now,
+                          bios.sectors_read,
+                          sys.interpreted_instructions,
+                          card_ptr ? card_ptr->block_writes : 0,
+                          card_ptr ? card_ptr->screen_writes : 0,
+                          pvr.ta.chunks,
+                          gd};
+            if (ms > slow_ms)
+                std::fprintf(stderr,
+                             "slow frame %llu: %.1f ms | sectors +%llu, gd syscalls +%llu, "
+                             "interpreted +%llu, card writes +%llu, lcd +%llu, TA chunks +%llu\n",
+                             static_cast<unsigned long long>(f), ms,
+                             static_cast<unsigned long long>(next.sectors - slow_mark.sectors),
+                             static_cast<unsigned long long>(next.gd - slow_mark.gd),
+                             static_cast<unsigned long long>(next.interp - slow_mark.interp),
+                             static_cast<unsigned long long>(next.card - slow_mark.card),
+                             static_cast<unsigned long long>(next.lcd - slow_mark.lcd),
+                             static_cast<unsigned long long>(next.chunks - slow_mark.chunks));
+            slow_mark = next;
+        }
         while (replay_next < replayed.size() && replayed[replay_next].first <= f)
             pad_ptr->state = replayed[replay_next++].second;
         if (!scripted.empty()) {
@@ -2013,6 +2084,10 @@ int main(int argc, char** argv) {
     // headless run uses. Both hooks may already be taken (--dump-ta captures renders, the scripted
     // presses run at vblank), so each is chained rather than replaced.
     std::unique_ptr<Live> live;
+#ifdef DREAM_WITH_AUDIO
+    // Set once the sound device is open (below); the window's pacing then follows it.
+    dream::audio::Sink* paced_by = nullptr;
+#endif
     if (window_mode) {
         live = std::make_unique<Live>(sys.memory, pvr);
         live->writeback = writeback;
@@ -2094,6 +2169,18 @@ int main(int argc, char** argv) {
                 live->read_controls(pad_ptr->state);
             if (unthrottled)
                 return;
+#ifdef DREAM_WITH_AUDIO
+            // With sound, the device's clock paces the guest: the AICA makes one sample per
+            // 44.1 kHz tick of guest time, so keeping the device's queue near a level keeps the
+            // guest at real time with no clock of our own. Paced by the wall clock instead, a slow
+            // frame emptied the queue and the sprint to catch up then overfilled it, and F355
+            // Challenge both stuttered and dropped 7% of its samples. A frame too slow for the
+            // queue is still heard as a gap; nothing is dropped any more.
+            if (paced_by) {
+                paced_by->wait_below(dream::audio::Sink::kPaceFrames, 1000);
+                return;
+            }
+#endif
             const auto guest =
                 std::chrono::duration<double>(static_cast<double>(sys.ctx.cycles) / 200e6);
             const auto target =
@@ -2121,9 +2208,10 @@ int main(int argc, char** argv) {
     dream::audio::Sink sink;
     const bool want_audio = !no_audio && (audio || window_mode);
     if (want_audio) {
-        if (sink.open())
+        if (sink.open()) {
             std::printf("audio: playing through the default device\n");
-        else
+            paced_by = window_mode ? &sink : nullptr;
+        } else
             std::fprintf(stderr, "audio: %s\n", sink.error().c_str());
     }
 #else
