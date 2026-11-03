@@ -118,6 +118,15 @@ function(dream_add_game id)
     target_compile_definitions(${id}_boot PRIVATE DREAM_WITH_AUDIO)
   endif()
   dream_target_defaults(${id}_boot)
+  # Windows finds a program's DLLs beside it: SDL3's goes next to the game, so it starts from the
+  # launcher or a shortcut without anything on PATH. A build with no SDL3 has nothing to copy.
+  if(WIN32)
+    add_custom_command(TARGET ${id}_boot POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E
+              $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:${id}_boot>>,copy_if_different,true>
+              $<TARGET_RUNTIME_DLLS:${id}_boot> $<TARGET_FILE_DIR:${id}_boot>
+      COMMAND_EXPAND_LISTS)
+  endif()
   if(NOT MSVC)
     # Tens of megabytes of generated C++: keep the optimiser modest so the edit-build-run loop
     # stays short.
