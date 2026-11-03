@@ -94,3 +94,32 @@ TEST_CASE("switch: the index check bounds the table") {
     REQUIRE(sw.targets.size() == 2);
     CHECK(sw.targets[1] == 0x8C010024u);
 }
+
+TEST_CASE("switch: a byte table read through extu.b holds unsigned offsets") {
+    // GCC's shape in F355 Challenge (0x0c097f5a) and 18 Wheeler (0x0c133946):
+    //   mov #4,r2 ; cmp/hi r2,r1 ; nop ; mova tbl,r0 ; mov.b @(r0,r1),r1 ; extu.b r1,r1 ;
+    //   braf r1 ; nop ; tbl: .byte 6,8,10,12,0x86
+    // The extu.b used to stop the walk back to the table load, and 0x86 is past 0x7F: read
+    // signed, it would land before the table.
+    Image img;
+    img.base = 0x0C010000u;
+    for (std::uint16_t w : {0xE204, 0x3126, 0x0009, 0xC702, 0x011C, 0x611C, 0x0123, 0x0009}) {
+        img.bytes.push_back(static_cast<std::uint8_t>(w));
+        img.bytes.push_back(static_cast<std::uint8_t>(w >> 8));
+    }
+    for (std::uint8_t b : {0x06, 0x08, 0x0A, 0x0C, 0x86, 0x00}) img.bytes.push_back(b);
+    while (img.bytes.size() < 0xA0) {
+        img.bytes.push_back(0x09);  // nop
+        img.bytes.push_back(0x00);
+    }
+    const std::uint32_t jump_pc = img.base + 0x0C;
+    SwitchTable sw;
+    REQUIRE(recover_switch(img, img.base, jump_pc, dream::sh4::decode(img.read16(jump_pc)),
+                           img.base, img.base + 0xA0, sw));
+    CHECK(sw.table == img.base + 0x10);
+    CHECK(sw.entry_size == 1);
+    REQUIRE(sw.targets.size() == 5);  // the cmp/hi bound: indices 0 to 4
+    CHECK(sw.targets[0] == img.base + 0x16);
+    CHECK(sw.targets[3] == img.base + 0x1C);
+    CHECK(sw.targets[4] == img.base + 0x96);
+}

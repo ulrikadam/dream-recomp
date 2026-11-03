@@ -169,6 +169,7 @@ bool recover_switch(const Image& img, std::uint32_t block_start, std::uint32_t j
     unsigned jreg = jump.m;
     std::uint32_t p = jump_pc;
     bool table_relative = false;
+    bool zero_extend = false;  // the offset went through extu.b/extu.w: entries are unsigned
     unsigned base_reg_for_add = 16;
     // Walk back to the definition of the jump register.
     Instr def{};
@@ -192,6 +193,15 @@ bool recover_switch(const Image& img, std::uint32_t block_start, std::uint32_t j
             break;
         }
         if (i.op == Op::MOV) {  // copied from another register: follow it
+            jreg = i.m;
+            continue;
+        }
+        if ((i.op == Op::EXTU_B || i.op == Op::EXTU_W) && !zero_extend) {
+            // `mova tbl,r0 ; mov.b @(r0,Ri),J ; extu.b J,J ; braf J`: GCC's byte table of
+            // unsigned offsets (F355 Challenge 0x0c097f5a, 18 Wheeler 0x0c133946). Unrecovered,
+            // every case went through the function table, and each pass of the loop around the
+            // switch nested one more host call.
+            zero_extend = true;
             jreg = i.m;
             continue;
         }
@@ -301,9 +311,11 @@ bool recover_switch(const Image& img, std::uint32_t block_start, std::uint32_t j
         if (out.entry_size == 4)
             entry = static_cast<std::int32_t>(img.read32(ea));
         else if (out.entry_size == 2)
-            entry = static_cast<std::int16_t>(img.read16(ea));
+            entry = zero_extend ? static_cast<std::int32_t>(img.read16(ea))
+                                : static_cast<std::int16_t>(img.read16(ea));
         else
-            entry = static_cast<std::int8_t>(img.bytes[ea - img.base]);
+            entry = zero_extend ? static_cast<std::int32_t>(img.bytes[ea - img.base])
+                                : static_cast<std::int8_t>(img.bytes[ea - img.base]);
         std::uint32_t target;
         if (out.relative_to_pc)
             target = jump_pc + 4 + static_cast<std::uint32_t>(entry);
