@@ -9,11 +9,21 @@
 // device list behave the same here as in a game. The library is drawn with the overlay font
 // into an RGBA buffer and handed to the presenter, as a game's frame is.
 //
+// AJOUTER UN JEU asks for a disc image and does what a person does by hand to bring a title up
+// (importer.h): dcdisc, CMake, test runs that find what discovery missed, and a status. It runs on
+// a thread of its own with the steps shown over the library; B stops it. Every session played
+// from here does the same in small: what the game reached that its translation lacks goes into
+// its configuration, and the game is built again behind the library (after_play).
+//
 //   dream_launcher [--root DIR] [--build DIR] [--saves DIR] [--logs DIR] [--ui-assets DIR]
-//   dream_launcher --screenshot FILE.ppm [--select N] [--tab controller|memory]
-//       draws one frame to a file, no window; --tab draws the settings screen over it
+//                  [--dcdisc PROGRAM] [--discs DIR]
+//   dream_launcher --import DISC     adds a game without a window, printing each step
+//   dream_launcher --screenshot FILE.ppm [--select N] [--tab controller|memory|import|update]
+//       draws one frame to a file, no window; --tab draws the settings screen over it, or the
+//       screen shown while a game is added or built again
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,8 +32,11 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "dream/render/overlay.h"
@@ -33,6 +46,7 @@
 #include "dream/runtime/maple/maple.h"
 #include "dream/runtime/maple/vmu_fs.h"
 
+#include "importer.h"
 #include "library.h"
 #include <SDL3/SDL.h>
 
@@ -102,12 +116,16 @@ std::string read_file(const fs::path& p) {
 
 struct Options {
     fs::path root, build, saves, logs, ui_assets;
+    fs::path dcdisc;       // the disc tool, for adding a game
+    fs::path discs;        // where the file dialog opens
+    fs::path import_disc;  // --import: add this disc without a window
     std::string screenshot, tab;
     int select = 0;
 };
 
-enum Action : int { kPlay, kSettings, kQuit, kActions };
-constexpr std::string_view kActionLabels[kActions] = {"JOUER", "REGLAGES MANETTE / VMU", "QUITTER"};
+enum Action : int { kPlay, kAdd, kSettings, kQuit, kActions };
+constexpr std::string_view kActionLabels[kActions] = {"JOUER", "AJOUTER UN JEU",
+                                                      "REGLAGES MANETTE / VMU", "QUITTER"};
 constexpr std::string_view kHelp = "HAUT/BAS: JEU  GAUCHE/DROITE: ACTION  A: VALIDER  B: QUITTER";
 
 using Slots = std::array<std::string, Menu::kSlots>;  // card file per slot, "" for an empty slot
@@ -500,6 +518,11 @@ void run_game(rd::vk::Window& w, const Options& o, const Game& g, State& s) {
         args.push_back("--ui-assets");
         args.push_back(utf8(o.ui_assets));
     }
+    // What the session reaches that the translation lacks, for after_play.
+    const fs::path suggest = o.logs / (g.id + "-play-suggest.toml");
+    fs::remove(suggest, ec);
+    args.push_back("--suggest-config");
+    args.push_back(utf8(suggest));
     std::vector<const char*> argv;
     for (const std::string& a : args) argv.push_back(a.c_str());
     argv.push_back(nullptr);
@@ -542,6 +565,348 @@ void run_game(rd::vk::Window& w, const Options& o, const Game& g, State& s) {
                                 ". JOURNAL: " + upper(g.id) + ".LOG";
 }
 
+// --- adding a game ---------------------------------------------------------------------------
+
+using dream::launcher::ImportStatus;
+
+// The file dialog's answer. It may come from the dialog's own thread.
+struct Pick {
+    std::mutex mutex;
+    bool open = false, answered = false;
+    std::string file;  // UTF-8; empty when the dialog was closed without a choice
+};
+
+void SDLCALL on_picked(void* userdata, const char* const* files, int) {
+    Pick& p = *static_cast<Pick*>(userdata);
+    std::lock_guard<std::mutex> lock(p.mutex);
+    p.answered = true;
+    p.file = files && files[0] ? files[0] : "";
+}
+
+// A game being added, or built again after a session found something: the work runs on a thread
+// of its own, shown over the library.
+struct Import {
+    Pick pick;
+    std::string start_dir;                 // the dialog reads it until it answers
+    std::unique_ptr<ImportStatus> status;  // set while something runs
+    std::thread worker;
+    bool update = false;  // building a game again, rather than adding one
+    std::string subject;  // the disc's file name, or the game's title
+    std::uint64_t started = 0;
+    bool busy() const { return status != nullptr; }
+};
+
+// A value from the build directory's CMakeCache.txt, "" when it is not there.
+std::string cache_value(const fs::path& build, std::string_view key) {
+    std::ifstream in(build / "CMakeCache.txt");
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::size_t colon = line.find(':'), eq = line.find('=');
+        if (colon != std::string::npos && eq != std::string::npos &&
+            line.compare(0, colon, key) == 0)
+            return line.substr(eq + 1);
+    }
+    return {};
+}
+
+// What adding a game needs that is missing here, as the message line says it; "" when nothing is.
+std::string import_blocker(const Options& o) {
+    std::error_code ec;
+    if (!fs::exists(o.build / "CMakeCache.txt", ec))
+        return "PAS DE DOSSIER DE COMPILATION ICI: " + upper(utf8(o.build));
+#ifdef _WIN32
+    // MSVC finds its headers and libraries through what vcvars64.bat puts in the environment.
+    const std::string compiler = cache_value(o.build, "CMAKE_CXX_COMPILER");
+    if (compiler.size() >= 6 && compiler.compare(compiler.size() - 6, 6, "cl.exe") == 0 &&
+        !SDL_getenv("VCINSTALLDIR"))
+        return "POUR AJOUTER UN JEU, OUVRIR LE LANCEUR PAR LANCEUR-DREAM-RECOMP.BAT";
+#endif
+    return {};
+}
+
+// Stops a program and what it started: CMake's Ninja and the compilers under it.
+void stop_process(SDL_Process* proc) {
+#ifdef _WIN32
+    const Sint64 pid =
+        SDL_GetNumberProperty(SDL_GetProcessProperties(proc), SDL_PROP_PROCESS_PID_NUMBER, 0);
+    if (pid > 0) {
+        const std::string id = std::to_string(pid);
+        const char* args[] = {"taskkill", "/F", "/T", "/PID", id.c_str(), nullptr};
+        const SDL_PropertiesID props = SDL_CreateProperties();
+        SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, args);
+        SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_NULL);
+        SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, SDL_PROCESS_STDIO_NULL);
+        if (SDL_Process* kill = SDL_CreateProcessWithProperties(props)) {
+            SDL_WaitProcess(kill, true, nullptr);
+            SDL_DestroyProcess(kill);
+        }
+        SDL_DestroyProperties(props);
+    }
+#endif
+    SDL_KillProcess(proc, true);
+}
+
+// The importer's Runner: the program's output goes to `log`; it is stopped when it runs past
+// `timeout_s` or the import is cancelled.
+int run_logged(const std::vector<std::string>& args, const fs::path& cwd, const fs::path& log_path,
+               unsigned timeout_s, const std::atomic<bool>& cancel) {
+    std::vector<const char*> argv;
+    for (const std::string& a : args) argv.push_back(a.c_str());
+    argv.push_back(nullptr);
+    SDL_IOStream* log = SDL_IOFromFile(utf8(log_path).c_str(), "w");
+    const SDL_PropertiesID props = SDL_CreateProperties();
+    SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, argv.data());
+    const std::string dir = utf8(cwd);
+    SDL_SetStringProperty(props, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, dir.c_str());
+    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, SDL_PROCESS_STDIO_NULL);
+    if (log) {
+        SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER,
+                              SDL_PROCESS_STDIO_REDIRECT);
+        SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_STDOUT_POINTER, log);
+        SDL_SetBooleanProperty(props, SDL_PROP_PROCESS_CREATE_STDERR_TO_STDOUT_BOOLEAN, true);
+    }
+    SDL_Process* proc = SDL_CreateProcessWithProperties(props);
+    SDL_DestroyProperties(props);
+    std::string note;
+    int code = -1;
+    if (!proc) {
+        note = "[lanceur] impossible de lancer " + args[0] + ": " + SDL_GetError() + "\n";
+    } else {
+        const std::uint64_t deadline = SDL_GetTicks() + std::uint64_t{timeout_s} * 1000;
+        while (!SDL_WaitProcess(proc, false, &code)) {
+            if (cancel || SDL_GetTicks() > deadline) {
+                note = cancel ? "\n[lanceur] annule\n"
+                              : "\n[lanceur] arrete apres " + std::to_string(timeout_s) + " s\n";
+                stop_process(proc);
+                SDL_WaitProcess(proc, true, &code);
+                code = -1;
+                break;
+            }
+            SDL_Delay(200);
+        }
+        SDL_DestroyProcess(proc);
+    }
+    if (log)
+        SDL_CloseIO(log);
+    if (!note.empty())
+        std::ofstream(log_path, std::ios::binary | std::ios::app) << note;
+    return code;
+}
+
+void ask_for_disc(rd::vk::Window& w, Import& imp, const Options& o, State& s) {
+    if (const std::string why = import_blocker(o); !why.empty()) {
+        s.message = why;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(imp.pick.mutex);
+        if (imp.pick.open)
+            return;
+        imp.pick.open = true;
+    }
+    static const SDL_DialogFileFilter kFilters[] = {
+        {"Disque Dreamcast (GDI, CDI, CHD)", "gdi;cdi;chd"}};
+    imp.start_dir = utf8(o.discs);
+    SDL_ShowOpenFileDialog(on_picked, &imp.pick, w.sdl_window(), kFilters, 1,
+                           imp.start_dir.empty() ? nullptr : imp.start_dir.c_str(), false);
+}
+
+dream::launcher::ImportOptions job_options(const Options& o) {
+    dream::launcher::ImportOptions io;
+    io.root = o.root;
+    io.build = o.build;
+    io.dcdisc = o.dcdisc;
+    io.logs = o.logs;
+    // The CMake that made the build directory, so nothing has to be on PATH for it.
+    if (std::string cmake = cache_value(o.build, "CMAKE_COMMAND"); !cmake.empty())
+        io.cmake = std::move(cmake);
+    return io;
+}
+
+// Runs `work` on the worker thread with programs started by run_logged.
+template <typename Work>
+void start_job(Import& imp, bool update, std::string subject, Work work) {
+    imp.status = std::make_unique<ImportStatus>();
+    imp.update = update;
+    imp.subject = std::move(subject);
+    imp.started = SDL_GetTicks();
+    ImportStatus* status = imp.status.get();
+    imp.worker = std::thread([work, status] {
+        work(
+            [status](const std::vector<std::string>& args, const fs::path& cwd, const fs::path& log,
+                     unsigned timeout_s) {
+                return run_logged(args, cwd, log, timeout_s, status->cancel);
+            },
+            *status);
+    });
+}
+
+void start_import(Import& imp, const Options& o, const std::string& disc) {
+    dream::launcher::ImportOptions io = job_options(o);
+    io.disc = from_utf8(disc.c_str());
+    start_job(imp, false, utf8(io.disc.filename()),
+              [io](const dream::launcher::Runner& run, ImportStatus& status) {
+                  dream::launcher::import_game(io, run, status);
+              });
+}
+
+// After a session: what the game reached that its translation lacks goes into its configuration,
+// and the game is built again, so the next session runs that code translated instead of through
+// the interpreter. A configuration newer than the executable (a build stopped half way, or
+// launched without the compilers) is built too.
+void after_play(Import& imp, State& s, const Options& o, const Game& g) {
+    const dream::launcher::Findings f =
+        dream::launcher::fold_findings(g.config, o.logs / (g.id + "-play-suggest.toml"));
+    if (!f.error.empty()) {
+        std::fprintf(stderr, "%s: %s\n", g.id.c_str(), f.error.c_str());
+        return;
+    }
+    std::error_code e1, e2;
+    const auto config_time = fs::last_write_time(g.config, e1);
+    const auto exe_time = fs::last_write_time(g.exe, e2);
+    const bool stale = !e1 && !e2 && config_time > exe_time;
+    const unsigned found = f.functions + f.relocations;
+    if (found == 0 && !stale)
+        return;
+    std::string done = upper(g.id) + " AMELIORE";
+    if (found)
+        done += ": " + std::to_string(found) + (found == 1 ? " AJOUT TROUVE" : " AJOUTS TROUVES") +
+                " EN JOUANT";
+    if (!import_blocker(o).empty()) {
+        s.message = "TROUVE EN JOUANT, NOTE POUR " + upper(g.id) +
+                    ": COMPILE QUAND LE LANCEUR EST OUVERT PAR LE .BAT";
+        return;
+    }
+    dream::launcher::ImportOptions io = job_options(o);
+    const std::string id = g.id;
+    start_job(imp, true, g.title,
+              [io, id, done](const dream::launcher::Runner& run, ImportStatus& status) {
+                  dream::launcher::update_game(io, id, done, run, status);
+              });
+}
+
+// The dialog answered, or the import ended: what the library shows changes.
+void poll_import(Import& imp, State& s, const Options& o) {
+    std::string picked;
+    bool answered = false;
+    {
+        std::lock_guard<std::mutex> lock(imp.pick.mutex);
+        if (imp.pick.answered) {
+            answered = true;
+            imp.pick.answered = imp.pick.open = false;
+            picked = std::move(imp.pick.file);
+        }
+    }
+    if (answered && !picked.empty() && !imp.busy()) {
+        s.message.clear();
+        start_import(imp, o, picked);
+    }
+    if (!imp.busy())
+        return;
+    std::string id, message;
+    fs::path log;
+    bool ok = false;
+    {
+        std::lock_guard<std::mutex> lock(imp.status->mutex);
+        if (!imp.status->done)
+            return;
+        id = imp.status->id;
+        message = imp.status->message;
+        log = imp.status->log;
+        ok = imp.status->ok;
+    }
+    imp.worker.join();
+    imp.status.reset();
+    rescan(s, o);
+    for (std::size_t i = 0; i < s.games.size(); ++i)
+        if (s.games[i].id == id)
+            s.sel = static_cast<int>(i);
+    s.action = ok || imp.update ? kPlay : kAdd;  // a game not rebuilt still plays as it was
+    s.message = message;
+    if (!ok && !log.empty())
+        s.message += ". JOURNAL: " + upper(utf8(log.filename()));
+}
+
+void stop_import(Import& imp) {
+    if (!imp.busy())
+        return;
+    imp.status->cancel = true;
+    imp.worker.join();
+    imp.status.reset();
+}
+
+// The screen over the library while a game is added or built again.
+void draw_import(Canvas& cv, bool update, std::string_view subject, std::string_view step,
+                 std::string_view id, std::uint64_t elapsed_ms, bool cancelling) {
+    constexpr int bw = 720, bh = 260, bx = (kW - bw) / 2, by = (kH - bh) / 2;
+    cv.fill(bx - 3, by - 3, bw + 6, bh + 6, kFocus);
+    cv.fill(bx, by, bw, bh, kPanel);
+    const int x = bx + 24, w = bw - 48;
+    cv.text(x, by + 20, update ? "AMELIORATION DU JEU" : "AJOUT D UN JEU", 3, kWhite);
+    cv.text(x, by + 60, rd::fit_text(upper(std::string(subject)), w, 2), 2, kGrey);
+    if (!id.empty())
+        cv.text(x, by + 84, rd::fit_text("NOM: " + upper(std::string(id)), w, 2), 2, kGrey);
+    cv.text(x, by + 120, rd::fit_text(cancelling ? "ARRET EN COURS..." : step, w, 2), 2,
+            cancelling ? kWarn : kLight);
+    // No real progress to show: a block moves along the bar while something runs.
+    cv.fill(x, by + 152, w, 12, kButton);
+    const int block = 120, travel = w - block;
+    const int pos = static_cast<int>(elapsed_ms / 8 % static_cast<std::uint64_t>(2 * travel));
+    cv.fill(x + (pos < travel ? pos : 2 * travel - pos), by + 152, block, 12, kFocus);
+    const unsigned secs = static_cast<unsigned>(elapsed_ms / 1000);
+    char clock[32];
+    std::snprintf(clock, sizeof clock, "TEMPS: %u:%02u", secs / 60, secs % 60);
+    cv.text(x, by + 180, clock, 2, kGrey);
+    cv.text(x, by + 204,
+            update ? "RECOMPILE AVEC CE QUE LA PARTIE A TROUVE"
+                   : "LA PREMIERE COMPILATION PEUT PRENDRE PLUSIEURS MINUTES",
+            2, kGrey);
+    cv.text(x, by + 228, update ? "B: PLUS TARD" : "B: ANNULER", 2, kGrey);
+}
+
+void draw_import(Canvas& cv, const Import& imp) {
+    std::string step, id;
+    {
+        std::lock_guard<std::mutex> lock(imp.status->mutex);
+        step = imp.status->step;
+        id = imp.status->id;
+    }
+    draw_import(cv, imp.update, imp.subject, step, id, SDL_GetTicks() - imp.started,
+                imp.status->cancel);
+}
+
+// --import: the same without a window, each step printed as it starts.
+int import_headless(const Options& o) {
+    if (const std::string why = import_blocker(o); !why.empty()) {
+        std::fprintf(stderr, "%s\n", why.c_str());
+        return 1;
+    }
+    Import imp;
+    start_import(imp, o, utf8(o.import_disc));
+    std::string last;
+    for (bool done = false; !done;) {
+        std::string step;
+        {
+            std::lock_guard<std::mutex> lock(imp.status->mutex);
+            step = imp.status->step;
+            done = imp.status->done;
+        }
+        if (!step.empty() && step != last) {
+            const unsigned secs = static_cast<unsigned>((SDL_GetTicks() - imp.started) / 1000);
+            std::printf("[%u:%02u] %s\n", secs / 60, secs % 60, step.c_str());
+            std::fflush(stdout);
+            last = step;
+        }
+        if (!done)
+            SDL_Delay(250);
+    }
+    imp.worker.join();
+    std::printf("%s\n", imp.status->message.c_str());
+    if (!imp.status->log.empty())
+        std::printf("journal: %s\n", utf8(imp.status->log).c_str());
+    return imp.status->ok ? 0 : 1;
+}
+
 // --- the library's own keys ------------------------------------------------------------------
 
 void move(State& s, int dsel, int daction) {
@@ -552,7 +917,8 @@ void move(State& s, int dsel, int daction) {
     s.message.clear();
 }
 
-void pump_library(rd::vk::Window& w, State& s, Settings& st, const Options& o, bool& running) {
+void pump_library(rd::vk::Window& w, State& s, Settings& st, Import& imp, const Options& o,
+                  bool& running) {
     if (w.pressed(Control::Up))
         move(s, -1, 0);
     if (w.pressed(Control::Down))
@@ -582,6 +948,10 @@ void pump_library(rd::vk::Window& w, State& s, Settings& st, const Options& o, b
         st.open(w, s, o);
         return;
     }
+    if (s.action == kAdd) {
+        ask_for_disc(w, imp, o, s);
+        return;
+    }
     const Game* g = s.game();
     if (!g)
         return;
@@ -589,8 +959,10 @@ void pump_library(rd::vk::Window& w, State& s, Settings& st, const Options& o, b
         s.message = "PAS ENCORE COMPILE: CONSTRUIRE " + upper(g->id) + "_BOOT";
     else if (!g->disc)
         s.message = "DISQUE ABSENT: VOIR GAMES/" + upper(g->id) + "/DISC";
-    else
+    else {
         run_game(w, o, *g, s);
+        after_play(imp, s, o, *g);
+    }
 }
 
 void present(rd::vk::Window& w, rd::vk::Presenter& p, const Canvas& cv) {
@@ -637,6 +1009,12 @@ bool parse_args(int argc, char** argv, Options& o) {
             o.logs = from_utf8(argv[++i]);
         else if (!std::strcmp(argv[i], "--ui-assets") && more)
             o.ui_assets = from_utf8(argv[++i]);
+        else if (!std::strcmp(argv[i], "--dcdisc") && more)
+            o.dcdisc = from_utf8(argv[++i]);
+        else if (!std::strcmp(argv[i], "--discs") && more)
+            o.discs = from_utf8(argv[++i]);
+        else if (!std::strcmp(argv[i], "--import") && more)
+            o.import_disc = from_utf8(argv[++i]);
         else if (!std::strcmp(argv[i], "--screenshot") && more)
             o.screenshot = argv[++i];
         else if (!std::strcmp(argv[i], "--select") && more)
@@ -646,7 +1024,8 @@ bool parse_args(int argc, char** argv, Options& o) {
         else {
             std::printf(
                 "usage: dream_launcher [--root DIR] [--build DIR] [--saves DIR] [--logs DIR]\n"
-                "                      [--ui-assets DIR]\n"
+                "                      [--ui-assets DIR] [--dcdisc PROGRAM] [--discs DIR]\n"
+                "       dream_launcher --import DISC   add a game without a window\n"
                 "       dream_launcher --screenshot FILE.ppm [--select N] [--tab T]\n"
                 "  --root       the checkout, where games/ is (default: the one it was built "
                 "from)\n"
@@ -654,8 +1033,11 @@ bool parse_args(int argc, char** argv, Options& o) {
                 "  --saves      memory cards; a game's own is <id>-vmu.bin (default: user data)\n"
                 "  --logs       each game's output, <id>.log (default: user data)\n"
                 "  --ui-assets  pictures for the settings screen\n"
+                "  --dcdisc     the disc tool, for adding a game (default: the checkout's .venv)\n"
+                "  --discs      where the dialog for adding a game opens\n"
                 "  --screenshot draw one frame to a PPM file and exit; --tab controller or memory\n"
-                "               draws the settings screen over it\n");
+                "               draws the settings screen over it, --tab import or update the\n"
+                "               screen shown while a game is added or built again\n");
             return false;
         }
     }
@@ -683,6 +1065,18 @@ int main(int argc, char** argv) {
         if (o.logs.empty())
             o.logs = data / "logs";
     }
+    if (o.dcdisc.empty()) {
+        std::error_code ec;
+        for (const fs::path& p : {o.root / ".venv/Scripts/dcdisc.exe", o.root / ".venv/bin/dcdisc"})
+            if (fs::exists(p, ec)) {
+                o.dcdisc = p;
+                break;
+            }
+        if (o.dcdisc.empty())
+            o.dcdisc = "dcdisc";  // from PATH
+    }
+    if (!o.import_disc.empty())
+        return import_headless(o);
 
     State s;
     load_cards(s, o);
@@ -693,7 +1087,13 @@ int main(int argc, char** argv) {
     if (!o.screenshot.empty()) {
         s.sel = std::clamp(o.select, 0, std::max(0, static_cast<int>(s.games.size()) - 1));
         draw(cv, s);
-        if (!o.tab.empty()) {
+        if (o.tab == "import" || o.tab == "update") {
+            const bool update = o.tab == "update";
+            draw_import(cv, update,
+                        update ? "Tokyo Highway Challenge" : "Demo Disc v1.000 (2000)(PAL)[!].gdi",
+                        update ? "TRADUCTION ET COMPILATION" : "TRADUCTION ET COMPILATION (1/3)",
+                        update ? "tokyohighwaychallenge" : "demo", 754000, false);
+        } else if (!o.tab.empty()) {
             st.menu.open(st.load_bindings(),
                          o.tab == "memory" ? Menu::Tab::Memory : Menu::Tab::Controller);
             st.refresh_cards(s, o);
@@ -715,17 +1115,26 @@ int main(int argc, char** argv) {
     w.set_bindings(st.load_bindings());
     w.set_escape_quits(false);  // escape goes back a step, as in the game's settings screen
 
+    Import imp;
     bool running = true;
     while (running && w.poll()) {
-        if (st.menu.is_open())
+        poll_import(imp, s, o);
+        if (imp.busy()) {
+            if (w.pressed(Control::Back))
+                imp.status->cancel = true;
+        } else if (st.menu.is_open()) {
             st.pump(w, s, o);
-        else
-            pump_library(w, s, st, o, running);
+        } else {
+            pump_library(w, s, st, imp, o, running);
+        }
         draw(cv, s);
         if (st.menu.is_open())
             st.menu.draw(cv.px.data(), kW, kW, kH, w.devices(), st.preview(w), st.art);
+        if (imp.busy())
+            draw_import(cv, imp);
         present(w, p, cv);
     }
+    stop_import(imp);  // closing the window stops an import half done
     vkDeviceWaitIdle(w.context().device());
     p.destroy();
     w.destroy();

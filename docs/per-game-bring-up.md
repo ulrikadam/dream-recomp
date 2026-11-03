@@ -107,6 +107,32 @@ read later as fact, and the next person re-derives from it. If you record one, r
 retraction next to it -- `docs/progress.md` in the Rayman 2 project keeps a retracted section on
 purpose, so nobody walks the same path twice.
 
+## The launcher does the first three steps
+
+`dream_launcher`'s AJOUTER UN JEU button (or `dream_launcher --import DISC`, without a window) runs
+Steps 1 to 3 below on its own, in `launcher/importer.cpp`:
+
+1. `dcdisc info` reads IP.BIN. A Windows CE disc is refused there, before anything is extracted, and
+   a disc the library has already (same product number, same region) is built and tested again
+   rather than added twice.
+2. `dcdisc new-game` writes the configuration, and the disc gets a place in `games/<id>/disc/`
+   (hard links, ignored by git), so the configuration says `disc/<id>.gdi` and can be shared as it is.
+3. CMake reconfigures and builds `<id>_boot`.
+4. A headless run of 3,000 frames, pressing Start then A to get past title screens, writes
+   `--suggest-config`. What it found is folded into the configuration and the game built again,
+   up to three rounds, until a run finds nothing new.
+5. The last run sets `[status]`: `boots` when it ran every frame and drew, `nothing` with where it
+   stopped otherwise. A status a person wrote is never replaced.
+
+Every session started from the launcher does Step 3 in small: the game runs with
+`--suggest-config`, and when it exits the launcher folds in what the session reached and builds the
+game again, so code played once runs translated the next time. Each step's output is in the
+launcher's log directory (`import-*.log`, `<id>-build.log`, `<id>-test.log`).
+
+What it cannot do is judgement: a translation fault, a hang, wrong graphics. Those are the rest of
+this document. San Francisco Rush 2049, V-Rally 2 and the others in the README needed a person;
+Tokyo Highway Challenge was the first title the launcher brought up alone.
+
 ## Step 1: make the project
 
 ```

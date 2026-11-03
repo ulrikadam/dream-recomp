@@ -69,3 +69,7 @@ tests/sh4/cprogs/*.elf
 # Regression captures (tools/regress/gate.py): keyed to one disc and one build, so they mean
 # nothing on another machine.
 .regress/
+
+# F12 in a game saves the frame where the game was started, which from the launcher is the
+# checkout. They are the player's, like save files.
+/screenshot-*.ppm
