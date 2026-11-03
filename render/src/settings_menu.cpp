@@ -266,7 +266,9 @@ void SettingsMenu::draw(u32* rgba, unsigned pitch, unsigned width, unsigned heig
         cache_height_ = height;
     }
     const int w = static_cast<int>(width), h = static_cast<int>(height);
-    const unsigned s = std::max(1u, width / 320u);
+    // Scaled to whichever of the two runs out first: on a wide frame (the launcher's 16:9) going by
+    // the width alone would push the binding list off the bottom.
+    const unsigned s = std::max(1u, std::min(width / 320u, height / 240u));
     const int si = static_cast<int>(s);
     const int line = static_cast<int>(text_height(s)) + si;
     const int pad = si * 6;
