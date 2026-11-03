@@ -1,0 +1,68 @@
+# V-RALLY 2 EXPERT EDITION, T15105D 50
+# Written by `dcdisc new-game`. Everything here is read off the disc or is the standard Katana
+# layout; nothing from the disc itself is ever committed.
+
+[game]
+id = "vrally2"
+title = "V-RALLY 2 EXPERT EDITION"
+region = "Europe"
+product = "T15105D 50"
+
+[disc]
+image = "disc/vrally2.gdi"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+# Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
+# here. Run the launcher with --suggest-config FILE and it writes them for you.
+[functions]
+extra = [0x0C01E070,
+         0x0C023D70,
+         0x0C075814,
+         0x0C0A78A6,
+         0x0C0B91A8,
+         0x0C252674,
+         0x0C2526BE,
+         0x0C252750,
+         0x0C25275A,
+         0x0C252796,
+         0x0C25280E,
+         0x0C2528A2,
+         0x0C2528B2]
+
+# Code the game copies below its load address (the VBR handlers and helpers), from the
+# run report: without these it runs in the interpreter.
+
+[[relocations]]
+source = 0x0C238ABC
+size = 0x34
+dest = 0x8C000000
+
+[[relocations]]
+source = 0x0C238A28
+size = 0x34
+dest = 0x8C000100
+
+[[relocations]]
+source = 0x0C238A28
+size = 0x34
+dest = 0x8C000400
+
+[[relocations]]
+source = 0x0C238A60
+size = 0x58
+dest = 0x8C000600
+
+[[relocations]]
+source = 0x0C251010
+size = 0x84
+dest = 0x8C003234
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, memory card, races and sound."

@@ -1,0 +1,54 @@
+# TOKYO HIGHWAY CHALLENGE, T40201D 50
+# Written by `dcdisc new-game`. Everything here is read off the disc or is the standard Katana
+# layout; nothing from the disc itself is ever committed.
+
+[game]
+id = "tokyohighwaychallenge"
+title = "TOKYO HIGHWAY CHALLENGE"
+region = "Europe"
+product = "T40201D 50"
+
+[disc]
+image = "disc/tokyohighwaychallenge.gdi"
+
+[binary]
+path = "extracted/fs/1ST_READ.BIN"
+load_address = 0x8C010000    # where the console's BIOS loads the file
+link_address = 0x0C010000    # the same RAM through a different address; what the code assumes
+entry = 0x8C010000           # the first instruction
+
+# Addresses discovery does not reach, and regions the program copies and runs elsewhere, both go
+# here. Run the launcher with --suggest-config FILE and it writes them for you.
+# [functions]
+# extra = []
+
+# Code the program copied and ran elsewhere, found by the launcher.
+[[relocations]]
+source = 0x0C0CC304
+size = 0x00000038
+dest = 0x8C000100
+
+[[relocations]]
+source = 0x0C0CC304
+size = 0x00000038
+dest = 0x8C000400
+
+[[relocations]]
+source = 0x0C0CC338
+size = 0x00000038
+dest = 0x8C000600
+
+[[relocations]]
+source = 0x0C080174
+size = 0x0000005C
+dest = 0x8C001984
+
+[[relocations]]
+source = 0x0C11421C
+size = 0x00000044
+dest = 0x8C003234
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "boots"
+note = "Added by the launcher: ran 3000 frames headless and drew 2793 of them; not played yet."
