@@ -54,6 +54,7 @@
 #include "dream/render/background.h"
 #include "dream/render/display_list.h"
 #include "dream/render/framebuffer.h"
+#include "dream/render/guard_band.h"
 #include "dream/render/overlay.h"
 #include "dream/render/settings_menu.h"
 #include "dream/render/vk/offscreen.h"
@@ -213,11 +214,15 @@ struct Live {
         if (dream::render::add_background(decoder.frame(), pvr_.reg_block(), memory_.vram(),
                                           dream::mem::DcMemory::kVramSize))
             ++backgrounds;
+        // Vertices a title clamped near the camera lie millions of pixels off screen; the GPU
+        // gets those polygons already cut to a range it rasterises exactly.
+        dream::render::clip_to_guard_band(decoder.frame());
         const dream::render::Frame& frame = decoder.frame();
         // PT_ALPHA_REF: the punch-through threshold the guest chose, which changes per scene.
         geometry.alpha_ref = static_cast<float>(pvr_.reg(0x11C) & 0xFFu) / 255.0f;
         // The fog registers and table, which the title can change at any time.
         dream::render::describe_fog(pvr_.reg_block(), geometry.fog);
+        dream::render::vk::describe_write_clip(pvr_.reg_block(), geometry);
         // Palette memory is re-read every render but only invalidates the cache when it has
         // actually changed, which is rare; dropping it every frame would decode every texture
         // every frame.

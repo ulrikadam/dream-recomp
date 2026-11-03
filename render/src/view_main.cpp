@@ -17,6 +17,7 @@
 #include "dream/render/background.h"
 #include "dream/render/display_list.h"
 #include "dream/render/framebuffer.h"
+#include "dream/render/guard_band.h"
 #include "dream/render/tsp.h"
 #include "dream/render/vk/renderer.h"
 #include "dream/render/vk/window.h"
@@ -222,11 +223,14 @@ int main(int argc, char** argv) {
             // PT_ALPHA_REF at +0x11C: the punch-through threshold the guest chose.
             geometry.alpha_ref = static_cast<float>(pvr_regs[0x11C / 4] & 0xFFu) / 255.0f;
             dream::render::describe_fog(pvr_regs.data(), geometry.fog);
+            dream::render::vk::describe_write_clip(pvr_regs.data(), geometry);
         }
         renderer.set_memory(vram.data(), vram.size(), palette_ram, palette_format);
         if (!pvr_regs.empty() && dream::render::add_background(decoder.frame(), pvr_regs.data(),
                                                                vram.data(), vram.size()))
             std::printf("  background plane added\n");
+        if (const std::size_t cut = dream::render::clip_to_guard_band(decoder.frame()))
+            std::printf("  %zu polygons cut to the guard band\n", cut);
         std::printf("  video memory %zu bytes, palette format %u\n", vram.size(),
                     static_cast<unsigned>(palette_format));
 

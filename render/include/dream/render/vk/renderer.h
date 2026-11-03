@@ -29,7 +29,14 @@ struct FrameGeometry {
     float alpha_ref = 1.0f / 255.0f;
     // The fog registers and table (describe_fog). The default fogs nothing: a zero table.
     FogSettings fog;
+    // FB_X_CLIP and FB_Y_CLIP: the guest pixels the hardware writes, right and bottom exclusive.
+    // Nothing outside is drawn. Rush 2049 shows 470 lines and writes lines 4 to 443; drawing the
+    // rest put pieces of the scene in the band below. Empty (all zero) draws everything.
+    float write_x0 = 0, write_y0 = 0, write_x1 = 0, write_y1 = 0;
 };
+
+// The write rectangle FB_X_CLIP and FB_Y_CLIP describe, from the PVR registers (0x5F8000 on).
+void describe_write_clip(const std::uint32_t* pvr_regs, FrameGeometry& geometry);
 
 // The attachments a three-subpass render pass (Offscreen) gives the renderer for sorting
 // translucent fragments per pixel. Null views mean the render pass has one subpass and

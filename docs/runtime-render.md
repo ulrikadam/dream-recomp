@@ -96,12 +96,24 @@ captured frame:
 
 ## Drawing a frame (`render/vk/renderer.{h,cpp}`)
 
-Opaque geometry, untextured, with the hardware's depth and culling. Three things are worth knowing:
+Opaque geometry, untextured, with the hardware's depth and culling. Five things are worth knowing:
 
 - **The coordinates are already in screen space.** There is no model or view transform: x and y are
-  pixels and z is 1/w. The rasteriser is given w = 1 so it does not perspective-divide, and
-  perspective correction is done by hand the way the hardware does it, multiplying attributes by
-  1/w in the vertex shader and dividing in the fragment shader.
+  pixels and z is 1/w. The rasteriser is given the real w, with x and y multiplied by it, as
+  Flycast does, so it clips in homogeneous space and does the perspective correction itself. 1/w
+  and the guest position are linear in screen space and go `noperspective`, for depth, fog and the
+  user clip. It used to be given w = 1 with the attributes divided by hand, and a vertex a title
+  clamps near the camera tore its polygon apart (18 Wheeler's sky drew black).
+- **Polygons reaching far off screen are cut to a guard band first** (`render/guard_band.{h,cpp}`,
+  x and y within -2048..4096 pixels). Titles clamp 1/w for vertices behind the camera, which
+  projects them tens of millions of pixels away; the GPU then interpolates across that range with
+  too little precision, and San Francisco Rush 2049's sky dome drew black wedges that changed with
+  the window size. The cut is in screen space, where x, y and 1/w are linear, with colours and
+  texture coordinates interpolated over 1/w. A polygon with a vertex at or behind 1/w = 0 is left
+  to the rasteriser's own clipping.
+- **The written region is a scissor.** `FB_X_CLIP` and `FB_Y_CLIP` bound what the hardware writes;
+  Rush 2049 draws scene geometry below its 443rd line and relies on the clip to hide it under the
+  dashboard band (`describe_write_clip`).
 - **Depth is written from the fragment shader**, as `log2(1 + 100000/w) / 34`. The hardware's depth
   is 1/w over a very wide range and Vulkan's depth range is not, so the logarithm spreads it over
   the available precision. This costs early-Z, which is the trade Flycast makes too. The depth

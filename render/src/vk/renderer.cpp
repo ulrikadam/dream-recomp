@@ -685,7 +685,22 @@ void Renderer::draw(VkCommandBuffer cmd, const Frame& frame, const FrameGeometry
     push.scale[1] = 2.0f / geometry.height;
     push.offset[0] = -1.0f - 2.0f * geometry.left / geometry.width;
     push.offset[1] = -1.0f - 2.0f * geometry.top / geometry.height;
-    (void)target;
+    // The write clip, scaled from guest pixels to the target like everything else.
+    if (geometry.write_x1 > geometry.write_x0 && geometry.write_y1 > geometry.write_y0) {
+        const float sx = static_cast<float>(target.width) / geometry.width;
+        const float sy = static_cast<float>(target.height) / geometry.height;
+        auto px = [](float v, std::uint32_t limit) {
+            return static_cast<std::int32_t>(std::clamp(v, 0.0f, static_cast<float>(limit)));
+        };
+        const std::int32_t x0 = px((geometry.write_x0 - geometry.left) * sx, target.width);
+        const std::int32_t y0 = px((geometry.write_y0 - geometry.top) * sy, target.height);
+        const std::int32_t x1 = px((geometry.write_x1 - geometry.left) * sx, target.width);
+        const std::int32_t y1 = px((geometry.write_y1 - geometry.top) * sy, target.height);
+        const VkRect2D scissor{{x0, y0},
+                               {static_cast<std::uint32_t>(std::max(x1 - x0, 0)),
+                                static_cast<std::uint32_t>(std::max(y1 - y0, 0))}};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+    }
 
     const VkDeviceSize zero = 0;
     VkBuffer buffer = vertices_.handle();
@@ -853,6 +868,16 @@ void Renderer::destroy() {
         fs_ = VK_NULL_HANDLE;
     }
     ctx_ = nullptr;
+}
+
+void describe_write_clip(const std::uint32_t* pvr_regs, FrameGeometry& geometry) {
+    const std::uint32_t x = pvr_regs[0x068 / 4], y = pvr_regs[0x06C / 4];  // FB_X_CLIP, FB_Y_CLIP
+    geometry.write_x0 = static_cast<float>(x & 0x7FFu);
+    geometry.write_x1 = static_cast<float>(((x >> 16) & 0x7FFu) + 1u);
+    geometry.write_y0 = static_cast<float>(y & 0x3FFu);
+    geometry.write_y1 = static_cast<float>(((y >> 16) & 0x3FFu) + 1u);
+    if (x == 0 && y == 0)
+        geometry.write_x0 = geometry.write_x1 = geometry.write_y0 = geometry.write_y1 = 0;
 }
 
 }  // namespace dream::render::vk
