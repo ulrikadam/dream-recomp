@@ -49,3 +49,8 @@ dest = 0x8C000600
 source = 0x0C174130
 size = 0x44
 dest = 0x8C003234
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, memory card, missions and sound."

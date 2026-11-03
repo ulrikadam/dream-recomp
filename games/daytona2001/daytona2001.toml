@@ -54,3 +54,8 @@ dest = 0x8C000600
 source = 0x0C1646C0
 size = 0xCC
 dest = 0x8C00322C
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, memory card, races and sound. Some grass at the screen edge draws white or black, and shadows are missing."

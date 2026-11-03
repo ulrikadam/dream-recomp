@@ -23,3 +23,8 @@ entry = 0x8C010000                   # the first instruction
 # here. Run the launcher with --suggest-config FILE and it writes them for you.
 # [functions]
 # extra = []
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Menus, memory card, races and sound. A few sky artifacts in races."
