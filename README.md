@@ -26,13 +26,15 @@ records how far it gets.
 
 | Title | Status | Notes |
 |---|---|---|
-| San Francisco Rush 2049 (PAL) | Playable | Menus, memory card, races, sound. A few sky artifacts. |
+| San Francisco Rush 2049 (PAL) | Playable | Menus, memory card, races, sound. |
 | Daytona USA 2001 (PAL) | Playable | Menus, memory card, races, sound. Some grass at the screen edge draws white or black; no shadows yet. |
 | Crazy Taxi 2 (PAL) | Playable | Menus, memory card, missions, sound. No code changes were needed. |
 | Crazy Taxi (PAL) | Playable | Menus, memory card, play, sound. |
 | F355 Challenge (PAL) | Playable | Menus, memory card, races, sound. The save screen's help text overlaps. |
 | Sega GT (PAL) | Playable | Intro movie, menus, a full race. |
 | 18 Wheeler: American Pro Trucker (PAL) | Playable | Menus, truck select, races. |
+| V-Rally 2 Expert Edition (PAL) | Playable | Menus, memory card, races, sound. |
+| Tokyo Highway Challenge (PAL) | Boots | Added by the launcher alone, first try; played once, not yet rated. |
 | Crazy Taxi (USA), Rez, Ikaruga | From upstream | Not re-tested here. |
 | Windows CE titles (Sega Rally 2...) | Unsupported | They boot through IP.BIN and run with the MMU on. |
 
@@ -53,22 +55,34 @@ records how far it gets.
   - double-buffered TA parameter lists, and TA resets that keep what was sent;
   - the interpreter leaving a run entered by a jump at its own return;
   - audio paced on the sound device, so a slow frame no longer stutters or drops samples;
-  - a 64 MB stack for game executables on Windows.
+  - a 64 MB stack for game executables on Windows;
+  - polygons reaching far off screen cut to a guard band, and the frame's write clip honoured;
+  - textures dropped when the CPU writes over them in video memory.
 - A settings screen for the controller and memory cards (F1 in a game).
 - `dream_launcher`: a game library window. It lists your games with their status, starts them with
   their memory cards, and opens the same settings screen.
+  - **AJOUTER UN JEU** takes a `.gdi`, `.cdi` or `.chd` and brings the title up alone: it extracts
+    the disc, builds the game, runs it headless to find the code discovery missed, folds that into
+    the configuration and builds again
+    ([docs/per-game-bring-up.md](docs/per-game-bring-up.md#the-launcher-does-the-first-three-steps)).
+  - After each session it does the same with what the session reached, so a game improves as it is
+    played.
 
 **Playing a game here**, once the build in [docs/dev-setup.md](docs/dev-setup.md) works:
 
-1. Make the game's configuration and build its executable:
+1. Run `build/launcher/dream_launcher`. With MSVC, start it where the compiler's environment is set
+   (a Developer prompt, or a script that calls `vcvars64.bat`), so it can build games.
+2. Choose AJOUTER UN JEU and pick your disc image. The first build of a title takes some minutes.
+3. Choose JOUER.
 
-   ```bash
-   .venv/Scripts/dcdisc new-game path/to/your.gdi
-   cmake --build build
-   ```
+By hand instead, the launcher's first steps are:
 
-   On Linux and macOS, `dcdisc` is in `.venv/bin/` instead.
-2. Run `build/launcher/dream_launcher`.
+```bash
+.venv/Scripts/dcdisc new-game path/to/your.gdi
+cmake --build build
+```
+
+On Linux and macOS, `dcdisc` is in `.venv/bin/` instead.
 
 Bug reports and title reports are welcome in this fork's issues.
 
