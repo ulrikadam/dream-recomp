@@ -95,6 +95,15 @@ function(dream_add_game id)
 
   add_executable(${id}_boot ${DREAM_ROOT}/runtime/boot/boot_main.cpp ${_units})
   target_link_libraries(${id}_boot PRIVATE dream::runtime dream::translator)
+  # The guest runs on the main thread, and its calls are host calls: deep guest call chains, the
+  # interpreter's frames between translated ones, and exception handlers all stack up there. The
+  # Windows default of 1 MB overflowed in F355 Challenge (frame 40); Linux and macOS default to
+  # 8 MB. Reserved, not committed: memory is only used as the stack grows.
+  if(MSVC)
+    target_link_options(${id}_boot PRIVATE /STACK:67108864)
+    # A large title's unit has more functions than a COFF object's default 65,279 sections.
+    target_compile_options(${id}_boot PRIVATE /bigobj)
+  endif()
   # --window needs the Vulkan backend, which is optional (render/CMakeLists.txt returns early when
   # Vulkan, SDL3 or glslc are missing). Without it the launcher still builds and runs headless, and
   # --window says this build has no renderer rather than doing nothing.
