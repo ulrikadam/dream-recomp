@@ -59,14 +59,21 @@ records how far it gets.
   - polygons reaching far off screen cut to a guard band, and the frame's write clip honoured;
   - textures dropped when the CPU writes over them in video memory.
 - A settings screen for the controller and memory cards (F1 in a game).
-- `dream_launcher`: a game library window. It lists your games with their status, starts them with
-  their memory cards, and opens the same settings screen.
-  - **AJOUTER UN JEU** takes a `.gdi`, `.cdi` or `.chd` and brings the title up alone: it extracts
-    the disc, builds the game, runs it headless to find the code discovery missed, folds that into
-    the configuration and builds again
+- `dream_launcher`: a game library window, in French, with a bar along the bottom of every screen
+  (JOUER, AJOUTER UN JEU, CARTES VMU, MANETTE, QUITTER) that the shoulder buttons, Q/W or a click
+  move along.
+  - **JOUER** lists your games with their status and starts them.
+  - **AJOUTER UN JEU** lists the disc images in your dumps folder, marks those already added, and
+    brings a title up alone: it extracts the disc, builds the game, runs it headless to find the
+    code discovery missed, folds that into the configuration and builds again
     ([docs/per-game-bring-up.md](docs/per-game-bring-up.md#the-launcher-does-the-first-three-steps)).
-  - After each session it does the same with what the session reached, so a game improves as it is
+    After each session it does the same with what the session reached, so a game improves as it is
     played.
+  - **CARTES VMU**: memory cards shared by every game, as real ones are. A VMU drawn by the program
+    shows each save on its screen; saves are copied between cards or deleted, new cards made, and a
+    card plugged into the pad's slot A1 or A2 for every game. The first start gathers the older
+    one-card-per-game saves onto VMU 1.
+  - **MANETTE**: the controller bindings every game reads, changed in the launcher's own look.
 
 **Playing a game here**, once the build in [docs/dev-setup.md](docs/dev-setup.md) works:
 
