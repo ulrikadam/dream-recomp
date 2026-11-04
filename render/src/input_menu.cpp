@@ -154,6 +154,32 @@ void InputMenu::draw(u32* rgba, unsigned pitch, unsigned width, unsigned height,
     draw_text(rgba, pitch, width, height, left, cy + card_h - line, help, hint);
 }
 
+std::vector<InputRow> InputMenu::rows(const std::vector<std::string>& devices) const {
+    std::vector<InputRow> out;
+    auto add = [&](int index, InputRow::Kind kind) -> InputRow& {
+        InputRow r;
+        r.kind = kind;
+        r.selected = index == row_;
+        out.push_back(std::move(r));
+        return out.back();
+    };
+    add(kDeviceRow, InputRow::Kind::Device).value =
+        device_ < devices.size() ? devices[device_] : std::string("KEYBOARD");
+    add(kDeadzoneRow, InputRow::Kind::Deadzone).percent = bindings_.deadzone_percent;
+    add(kRampRow, InputRow::Kind::Ramp).on = bindings_.trigger_ramp;
+    for (unsigned i = 0; i < kPadControlCount; ++i) {
+        const auto c = static_cast<PadControl>(i);
+        const int index = kFirstBinding + static_cast<int>(i);
+        InputRow& r = add(index, InputRow::Kind::Binding);
+        r.control = c;
+        r.value = editing()[c].label();
+        r.waiting = awaiting_ && index == row_;
+    }
+    add(reset_row(), InputRow::Kind::Reset);
+    add(close_row(), InputRow::Kind::Close);
+    return out;
+}
+
 int InputMenu::draw_rows(u32* rgba, unsigned pitch, unsigned width, unsigned height, int left,
                          int top, int right, unsigned s,
                          const std::vector<std::string>& devices) const {

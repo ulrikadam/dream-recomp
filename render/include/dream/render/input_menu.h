@@ -26,6 +26,19 @@ constexpr std::uint32_t kUiInk = 0xFF241E1Cu;
 constexpr std::uint32_t kUiGrey = 0xFF8A8A8Au;
 constexpr std::uint32_t kUiShade = 0xB4000000u;  // dims the game behind the card
 
+// One row as the screen has it, for a screen that draws the rows its own way and in its own
+// language (the launcher's MANETTE screen).
+struct InputRow {
+    enum class Kind { Device, Deadzone, Ramp, Binding, Reset, Close };
+    Kind kind = Kind::Binding;
+    PadControl control = PadControl::A;  // for a binding row
+    std::string value;                   // the device's name, or the binding's label ("--": none)
+    int percent = 0;                     // the dead zone
+    bool on = false;                     // the trigger ramp
+    bool selected = false;               // the cursor is on it
+    bool waiting = false;                // a binding row waiting for its new input
+};
+
 class InputMenu {
 public:
     enum class Action { None, Close, Save };
@@ -70,6 +83,10 @@ public:
 
     // The control the cursor is on, when it is on a binding row: what a picture should point at.
     bool selected_control(PadControl& out) const { return on_binding(row_, out); }
+
+    // Every row, top to bottom, as draw_rows shows them: the device, the dead zone, the ramp, one
+    // per control, then reset and close.
+    std::vector<InputRow> rows(const std::vector<std::string>& devices) const;
 
 private:
     // Rows above the bindings, then one row per control, then the rows below.

@@ -22,6 +22,26 @@ void go_to(InputMenu& m, PadControl c) {
 }
 }  // namespace
 
+TEST_CASE("the rows, for a screen that draws them itself, follow the cursor and a capture") {
+    InputMenu m = opened();
+    std::vector<InputRow> r = m.rows({"KEYBOARD", "PAD"});
+    REQUIRE(r.size() == 3 + kPadControlCount + 2);
+    CHECK(r[0].kind == InputRow::Kind::Device);
+    CHECK(r[0].value == "KEYBOARD");
+    CHECK(r[1].kind == InputRow::Kind::Deadzone);
+    CHECK(r[2].kind == InputRow::Kind::Ramp);
+    CHECK(r[3].kind == InputRow::Kind::Binding);
+    CHECK(r[3].control == PadControl::A);
+    CHECK(r[3].value == "Z");
+    CHECK(r[3].selected);  // a fresh screen starts on the first binding
+    CHECK(r.back().kind == InputRow::Kind::Close);
+    CHECK(r[r.size() - 2].kind == InputRow::Kind::Reset);
+    m.activate();  // waits for the new input for A
+    r = m.rows({"KEYBOARD"});
+    CHECK(r[3].waiting);
+    CHECK(!r[4].waiting);
+}
+
 TEST_CASE("opening takes a copy and starts clean") {
     Bindings b = Bindings::defaults();
     b.deadzone_percent = 33;
