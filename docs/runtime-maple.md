@@ -67,6 +67,16 @@ With the owner's Crazy Taxi save (Flycast writes one per title as
 `<product-id>_vmu_save_A1.bin`, and Crazy Taxi's product code MK-51035 is in its own IP.BIN) the
 title reads the file and says so on screen: "File loaded from the VMU".
 
+**One card, many games** (2026-11-04). Like a real one, a card holds saves from several titles:
+each keeps its own files in the card's file system and finds them by name. `copy_vmu_file` and
+`delete_vmu_file` (vmu_fs.h) are the console file manager's two edits, made on the image alone. A
+copy takes free blocks from the top of the save area down, as the BIOS does, chains them in the
+allocation table and copies the directory entry with its new first block; copy protection is
+honoured unless the caller moves the player's own saves on purpose. The launcher keeps shared
+cards (`vmu-1.bin`, `vmu-2.bin`...) plugged into the pad for every game. Crazy Taxi reads its save
+from a card shared with F355 Challenge, Crazy Taxi 2 and Daytona USA 2001 exactly as it did from a
+card of its own: 38 block reads, nothing written.
+
 ## The card's screen, and what arrives on the wire
 
 The format of what a title sends the screen is no longer guesswork. KallistiOS is BSD-licensed

@@ -1,6 +1,9 @@
 #include "dream/runtime/maple/vmu_fs.h"
 
 #include <cstddef>
+#include <cstring>
+
+#include "dream/runtime/maple/maple.h"
 
 namespace dream::maple {
 namespace {
@@ -76,7 +79,142 @@ void read_header(const std::vector<std::uint8_t>& image, const std::uint8_t* fat
     }
 }
 
+void put16(std::uint8_t* p, unsigned v) {
+    p[0] = static_cast<std::uint8_t>(v & 0xFF);
+    p[1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+}
+
+// Where a formatted card keeps things, read from its system block and checked to be in range.
+struct Layout {
+    unsigned fat = 0, dir = 0, dir_blocks = 0, user_blocks = 0;
+    unsigned first_system() const { return dir + 1 - dir_blocks; }  // the lowest directory block
+};
+
+bool layout(const std::vector<std::uint8_t>& image, Layout& l) {
+    if (image.size() != kBlocks * kBlockSize)
+        return false;
+    const std::uint8_t* root = image.data() + 255 * kBlockSize;
+    for (unsigned i = 0; i < 16; ++i)
+        if (root[i] != 0x55)
+            return false;
+    l.fat = u16(root + 0x46);
+    l.dir = u16(root + 0x4A);
+    l.dir_blocks = u16(root + 0x4C);
+    l.user_blocks = u16(root + 0x50);
+    return l.fat < kBlocks && l.dir < kBlocks && l.dir_blocks >= 1 && l.dir_blocks <= l.dir + 1 &&
+           l.user_blocks <= l.first_system();
+}
+
+// Every directory slot, as an offset into the image, in the order the directory runs.
+std::vector<std::size_t> slots(const Layout& l) {
+    std::vector<std::size_t> out;
+    for (unsigned k = 0; k < l.dir_blocks; ++k)
+        for (std::size_t e = 0; e < kBlockSize / kEntrySize; ++e)
+            out.push_back((l.dir - k) * kBlockSize + e * kEntrySize);
+    return out;
+}
+
+bool in_use(const std::uint8_t* entry) {
+    return entry[0] == 0x33 || entry[0] == 0xCC;
+}
+
+// The directory entry of the file read_vmu would list as `name`, or npos.
+std::size_t find_entry(const std::vector<std::uint8_t>& image, const Layout& l,
+                       std::string_view name) {
+    for (std::size_t off : slots(l))
+        if (in_use(image.data() + off) && text(image.data() + off + 4, 12) == name)
+            return off;
+    return static_cast<std::size_t>(-1);
+}
+
 }  // namespace
+
+std::vector<std::uint8_t> blank_vmu() {
+    MemoryCard card;
+    card.format();
+    return card.image();
+}
+
+VmuEdit copy_vmu_file(const std::vector<std::uint8_t>& from, std::string_view name,
+                      std::vector<std::uint8_t>& to, bool ignore_protection) {
+    Layout lf, lt;
+    if (!layout(from, lf) || !layout(to, lt))
+        return VmuEdit::NotACard;
+    const std::size_t src = find_entry(from, lf, name);
+    if (src == static_cast<std::size_t>(-1))
+        return VmuEdit::NotFound;
+    const std::uint8_t* entry = from.data() + src;
+    if (entry[0] == 0xCC)
+        return VmuEdit::MiniGame;
+    if (entry[1] == 0xFF && !ignore_protection)
+        return VmuEdit::Protected;
+    if (find_entry(to, lt, name) != static_cast<std::size_t>(-1))
+        return VmuEdit::Exists;
+
+    // The source's blocks, in order; a chain that does not match the size it claims is refused
+    // rather than copied half.
+    const unsigned size = u16(entry + 0x18);
+    const std::uint8_t* from_fat = from.data() + lf.fat * kBlockSize;
+    std::vector<unsigned> chain;
+    for (unsigned b = u16(entry + 2); size > 0 && chain.size() < size;) {
+        if (b >= lf.first_system())
+            return VmuEdit::NotACard;
+        chain.push_back(b);
+        const std::uint16_t next = u16(from_fat + b * 2);
+        if (next == kFatLast || next == kFatFree)
+            break;
+        b = next;
+    }
+    if (size == 0 || chain.size() != size)
+        return VmuEdit::NotACard;
+
+    // Free blocks from the top of the save area down, and a free directory slot.
+    std::uint8_t* to_fat = to.data() + lt.fat * kBlockSize;
+    std::vector<unsigned> blocks;
+    for (unsigned b = lt.user_blocks; b-- > 0 && blocks.size() < size;)
+        if (u16(to_fat + b * 2) == kFatFree)
+            blocks.push_back(b);
+    if (blocks.size() < size)
+        return VmuEdit::NoSpace;
+    std::size_t slot = static_cast<std::size_t>(-1);
+    for (std::size_t off : slots(lt))
+        if (!in_use(to.data() + off)) {
+            slot = off;
+            break;
+        }
+    if (slot == static_cast<std::size_t>(-1))
+        return VmuEdit::DirectoryFull;
+
+    for (std::size_t i = 0; i < size; ++i) {
+        std::memcpy(to.data() + blocks[i] * kBlockSize, from.data() + chain[i] * kBlockSize,
+                    kBlockSize);
+        put16(to_fat + blocks[i] * 2, i + 1 < size ? blocks[i + 1] : kFatLast);
+    }
+    std::memcpy(to.data() + slot, entry, kEntrySize);
+    put16(to.data() + slot + 2, blocks[0]);
+    return VmuEdit::Done;
+}
+
+VmuEdit delete_vmu_file(std::vector<std::uint8_t>& image, std::string_view name) {
+    Layout l;
+    if (!layout(image, l))
+        return VmuEdit::NotACard;
+    const std::size_t off = find_entry(image, l, name);
+    if (off == static_cast<std::size_t>(-1))
+        return VmuEdit::NotFound;
+    std::uint8_t* fat = image.data() + l.fat * kBlockSize;
+    // Never past the save area into the directory, whatever a damaged chain says.
+    unsigned b = u16(image.data() + off + 2);
+    for (unsigned steps = 0; steps < kBlocks && b < l.first_system(); ++steps) {
+        const std::uint16_t next = u16(fat + b * 2);
+        put16(fat + b * 2, kFatFree);
+        if (next == kFatLast || next == kFatFree)
+            break;
+        b = next;
+    }
+    std::memset(image.data() + off, 0, kEntrySize);
+    return VmuEdit::Done;
+}
 
 VmuContents read_vmu(const std::vector<std::uint8_t>& image) {
     VmuContents c;
@@ -107,6 +245,7 @@ VmuContents read_vmu(const std::vector<std::uint8_t>& image) {
                 continue;
             VmuFile f;
             f.game = type == 0xCC;
+            f.no_copy = entry[1] == 0xFF;
             f.name = text(entry + 4, 12);
             f.blocks = u16(entry + 0x18);
             const unsigned first = u16(entry + 2);

@@ -78,6 +78,70 @@ TEST_CASE("a save is listed with its description and icon, following its chain")
     CHECK(f.icon[1001] == 0xFF00FF00u);
 }
 
+TEST_CASE("a save copies to another card whole, into the top of its free area") {
+    using dream::maple::VmuEdit;
+    const std::vector<std::uint8_t> from = card_with_one_save();
+    std::vector<std::uint8_t> to = dream::maple::blank_vmu();
+    // Something already at the top of the destination, so the copy has to go round it.
+    put16(to, 254 * kBlock + 199 * 2, 0xFFFA);
+    to[253 * kBlock + 32] = 0x33;
+    put16(to, 253 * kBlock + 32 + 2, 199);
+    put16(to, 253 * kBlock + 32 + 0x18, 1);
+    REQUIRE(dream::maple::copy_vmu_file(from, "RUSH2049", to) == VmuEdit::Done);
+    const auto c = dream::maple::read_vmu(to);
+    REQUIRE(c.files.size() == 2);
+    // The first free directory slot is the first one: the other file sits in the second.
+    const auto& f = c.files[0];
+    CHECK(f.name == "RUSH2049");
+    CHECK(f.description == "RUSH 2049 SAVE");
+    CHECK(f.blocks == 2);
+    CHECK(f.icon == dream::maple::read_vmu(from).files[0].icon);  // both blocks came across
+    CHECK(c.free_blocks == 197);
+    // Blocks 198 and 197, chained, and the entry pointing at the first.
+    CHECK(to[253 * kBlock + 2] == 198);
+    CHECK(to[254 * kBlock + 198 * 2] == 197);
+    CHECK(to[254 * kBlock + 197 * 2] == 0xFA);
+    // A title keeps one file of a name: a second copy is refused, and the card left as it was.
+    const std::vector<std::uint8_t> before = to;
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", to) == VmuEdit::Exists);
+    CHECK(to == before);
+    CHECK(dream::maple::copy_vmu_file(from, "NOSUCHFILE", to) == VmuEdit::NotFound);
+}
+
+TEST_CASE("a copy is refused when the card is full, protected, a mini-game, or not a card") {
+    using dream::maple::VmuEdit;
+    std::vector<std::uint8_t> from = card_with_one_save();
+    std::vector<std::uint8_t> full = dream::maple::blank_vmu();
+    for (unsigned b = 1; b < 200; ++b) put16(full, 254 * kBlock + b * 2, 0xFFFA);  // one free
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", full) == VmuEdit::NoSpace);
+    std::vector<std::uint8_t> crowded = dream::maple::blank_vmu();
+    for (unsigned k = 0; k < 13; ++k)
+        for (unsigned e = 0; e < 16; ++e) crowded[(253 - k) * kBlock + e * 32] = 0x33;
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", crowded) == VmuEdit::DirectoryFull);
+    std::vector<std::uint8_t> to = dream::maple::blank_vmu();
+    from[253 * kBlock + 1] = 0xFF;  // copy-protected
+    CHECK(dream::maple::read_vmu(from).files[0].no_copy);
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", to) == VmuEdit::Protected);
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", to, true) == VmuEdit::Done);
+    from[253 * kBlock] = 0xCC;  // a mini-game
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", to, true) == VmuEdit::MiniGame);
+    std::vector<std::uint8_t> junk(MemoryCard::kImageSize, 0);
+    CHECK(dream::maple::copy_vmu_file(from, "RUSH2049", junk) == VmuEdit::NotACard);
+}
+
+TEST_CASE("a deleted save frees its blocks and its directory slot") {
+    using dream::maple::VmuEdit;
+    std::vector<std::uint8_t> img = card_with_one_save();
+    CHECK(dream::maple::delete_vmu_file(img, "RUSH2049") == VmuEdit::Done);
+    const auto c = dream::maple::read_vmu(img);
+    CHECK(c.files.empty());
+    CHECK(c.free_blocks == 200);
+    CHECK(dream::maple::delete_vmu_file(img, "RUSH2049") == VmuEdit::NotFound);
+    // The space is usable again.
+    CHECK(dream::maple::copy_vmu_file(card_with_one_save(), "RUSH2049", img) == VmuEdit::Done);
+    CHECK(dream::maple::read_vmu(img).free_blocks == 198);
+}
+
 TEST_CASE("the card keeps what a title draws on its screen") {
     MemoryCard card;
     std::array<std::uint32_t, 2 + MemoryCard::kLcdBytes / 4> args{};
