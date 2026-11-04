@@ -86,6 +86,12 @@ public:
     // Went down since the previous poll(): for controls that act once rather than hold.
     bool pressed(Control c) const noexcept;
 
+    // A left click since the previous poll(), at (x, y) in an image of `image_w` x `image_h` shown
+    // in the window as present.h shows one: scaled to fit, its aspect kept, centred. False when
+    // there was none, or it fell on the bars beside the image. For the launcher's buttons; a game
+    // never asks.
+    bool take_click(int image_w, int image_h, int& x, int& y) noexcept;
+
     // Escape closes the window by default. The binding screen turns that off while it is up, so
     // that backing out of a capture is not also the end of the run; Control::Back still reports
     // the press either way.
@@ -188,6 +194,8 @@ private:
     VkPresentModeKHR choose_present_mode() const;
 
     bool capturing_ = false, captured_ = false, capture_cancelled_ = false;
+    bool clicked_ = false;
+    float click_x_ = 0.0f, click_y_ = 0.0f;  // window coordinates, as SDL reports them
     bool escape_quits_ = true;
     PresentMode wanted_present_ = PresentMode::Fifo;
     Binding capture_{};

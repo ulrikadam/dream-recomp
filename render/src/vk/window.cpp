@@ -372,13 +372,45 @@ bool Window::take_capture(Binding& out, bool& cancelled) noexcept {
     return true;
 }
 
+bool Window::take_click(int image_w, int image_h, int& x, int& y) noexcept {
+    if (!clicked_ || image_w <= 0 || image_h <= 0)
+        return false;
+    clicked_ = false;
+    int ww = 0, wh = 0;
+    if (!SDL_GetWindowSize(window_, &ww, &wh) || ww <= 0 || wh <= 0)
+        return false;
+    // The same fit as Presenter::draw: the axis with room to spare is shrunk, and centred.
+    const float image_aspect = static_cast<float>(image_w) / static_cast<float>(image_h);
+    float drawn_w = static_cast<float>(ww), drawn_h = static_cast<float>(wh);
+    if (drawn_w / drawn_h > image_aspect)
+        drawn_w = drawn_h * image_aspect;
+    else
+        drawn_h = drawn_w / image_aspect;
+    const float left = (static_cast<float>(ww) - drawn_w) * 0.5f,
+                top = (static_cast<float>(wh) - drawn_h) * 0.5f;
+    const float u = (click_x_ - left) / drawn_w, v = (click_y_ - top) / drawn_h;
+    if (u < 0.0f || v < 0.0f || u >= 1.0f || v >= 1.0f)
+        return false;
+    x = static_cast<int>(u * static_cast<float>(image_w));
+    y = static_cast<int>(v * static_cast<float>(image_h));
+    return true;
+}
+
 bool Window::poll() {
     // A capture consumes the physical input that ends it, so the key being bound does not also
     // reach the game on the same frame.
     bool captured_this_poll = false;
+    clicked_ = false;  // a click is for the poll it came in
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         switch (ev.type) {
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                if (ev.button.button == SDL_BUTTON_LEFT) {
+                    clicked_ = true;
+                    click_x_ = ev.button.x;
+                    click_y_ = ev.button.y;
+                }
+                break;
             case SDL_EVENT_QUIT:
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                 running_ = false;
