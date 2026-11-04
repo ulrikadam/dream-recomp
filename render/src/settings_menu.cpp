@@ -120,6 +120,10 @@ std::string card_label(std::string_view file) {
         file = file.substr(0, dot);
     std::string s(file);
     for (char& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    // A shared card, vmu-<n>.bin, reads as the player would name it: "VMU 3".
+    if (s.size() > 4 && s.compare(0, 4, "VMU-") == 0 &&
+        s.find_first_not_of("0123456789", 4) == std::string::npos)
+        s[3] = ' ';
     return s;
 }
 

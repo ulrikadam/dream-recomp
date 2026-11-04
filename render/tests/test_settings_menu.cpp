@@ -147,6 +147,9 @@ TEST_CASE("card file names become labels") {
     CHECK(dream::render::card_label("rush2049-vmu.bin") == "RUSH2049-VMU");
     CHECK(dream::render::card_label("C:/saves/card.bin") == "CARD");
     CHECK(dream::render::card_label("noext") == "NOEXT");
+    CHECK(dream::render::card_label("vmu-1.bin") == "VMU 1");
+    CHECK(dream::render::card_label("C:/saves/vmu-12.bin") == "VMU 12");
+    CHECK(dream::render::card_label("vmu-x.bin") == "VMU-X");
 }
 
 TEST_CASE("shrinking a cut-out picture keeps its shape and does not darken its edge") {

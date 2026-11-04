@@ -11,6 +11,7 @@ add_library(dream_render STATIC
   src/framebuffer.cpp
   src/background.cpp
   src/guard_band.cpp
+  src/vmu_art.cpp
   src/fog.cpp
   src/overlay.cpp
   src/input.cpp
@@ -25,7 +26,7 @@ add_library(dream::render ALIAS dream_render)
 
 # The device-independent half is tested on every runner, with or without a GPU.
 if(DREAM_BUILD_TESTS)
-  add_executable(dream_render_tests tests/test_display_list.cpp tests/test_texture.cpp tests/test_framebuffer.cpp tests/test_tsp.cpp tests/test_background.cpp tests/test_guard_band.cpp tests/test_fog.cpp tests/test_overlay.cpp tests/test_input.cpp tests/test_input_menu.cpp tests/test_settings_menu.cpp ${DREAM_ROOT}/runtime/tests/test_main.cpp)
+  add_executable(dream_render_tests tests/test_display_list.cpp tests/test_texture.cpp tests/test_framebuffer.cpp tests/test_tsp.cpp tests/test_background.cpp tests/test_guard_band.cpp tests/test_vmu_art.cpp tests/test_fog.cpp tests/test_overlay.cpp tests/test_input.cpp tests/test_input_menu.cpp tests/test_settings_menu.cpp ${DREAM_ROOT}/runtime/tests/test_main.cpp)
   target_link_libraries(dream_render_tests PRIVATE dream::render)
   target_include_directories(dream_render_tests SYSTEM PRIVATE ${DREAM_ROOT}/third_party/doctest)
   dream_target_defaults(dream_render_tests)
