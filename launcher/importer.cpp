@@ -9,6 +9,7 @@
 #include <toml.hpp>
 
 #include "config_edit.h"
+#include "discs.h"
 #include "library.h"
 
 namespace dream::launcher {
@@ -141,32 +142,6 @@ void set_done(ImportStatus& status, bool ok, const std::string& message, const f
 int build_game(const ImportOptions& opt, const std::string& id, const Runner& run) {
     return run({opt.cmake, "--build", utf8(opt.build), "--target", id + "_boot"}, opt.root,
                opt.logs / (id + "-build.log"), 3600);
-}
-
-// The track files a .gdi lists: "number lba type sector_size file offset" per line after the
-// count, the name quoted when it has spaces. Names with a directory in them are refused.
-std::vector<std::string> gdi_tracks(const std::string& text) {
-    std::istringstream in(text);
-    std::string line;
-    std::getline(in, line);  // the number of tracks
-    std::vector<std::string> files;
-    while (std::getline(in, line)) {
-        std::istringstream fields(line);
-        std::string number, lba, type, sector_size, name;
-        if (!(fields >> number >> lba >> type >> sector_size))
-            continue;
-        fields >> std::ws;
-        if (fields.peek() == '"') {
-            fields.get();
-            std::getline(fields, name, '"');
-        } else {
-            fields >> name;
-        }
-        if (name.empty() || fs::path(name).filename().string() != name)
-            return {};
-        files.push_back(name);
-    }
-    return files;
 }
 
 // `to` as a hard link to `from`; an existing `to` of the same size counts as done.

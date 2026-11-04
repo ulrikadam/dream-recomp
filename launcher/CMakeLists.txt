@@ -1,11 +1,11 @@
 # The game library window (WP3.6). The library half reads configuration files only, so it is built
 # and tested on every runner; the window needs SDL3 and is built with the renderer.
-add_library(dream_launcher_lib STATIC library.cpp config_edit.cpp importer.cpp)
-target_link_libraries(dream_launcher_lib PRIVATE dream::toml)
+add_library(dream_launcher_lib STATIC library.cpp config_edit.cpp importer.cpp cards.cpp discs.cpp)
+target_link_libraries(dream_launcher_lib PRIVATE dream::toml PUBLIC dream::runtime)
 dream_target_defaults(dream_launcher_lib)
 
 if(DREAM_BUILD_TESTS)
-  add_executable(dream_launcher_tests tests/test_library.cpp tests/test_config_edit.cpp tests/test_importer.cpp ${DREAM_ROOT}/runtime/tests/test_main.cpp)
+  add_executable(dream_launcher_tests tests/test_library.cpp tests/test_config_edit.cpp tests/test_importer.cpp tests/test_cards.cpp tests/test_discs.cpp ${DREAM_ROOT}/runtime/tests/test_main.cpp)
   target_link_libraries(dream_launcher_tests PRIVATE dream_launcher_lib dream::toml)
   target_include_directories(dream_launcher_tests SYSTEM PRIVATE ${DREAM_ROOT}/third_party/doctest)
   dream_target_defaults(dream_launcher_tests)
