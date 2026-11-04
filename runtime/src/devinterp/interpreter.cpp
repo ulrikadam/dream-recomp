@@ -267,17 +267,18 @@ struct Machine {
             case Op::MOV_L_L:
                 rn = m.read32(rm);
                 break;
+            // Rm is read before Rn moves: `mov.l r15,@-r15` stores the old r15.
             case Op::MOV_B_SD:
+                m.write8(rn - 1, static_cast<std::uint8_t>(rm));
                 rn -= 1;
-                m.write8(rn, static_cast<std::uint8_t>(rm));
                 break;
             case Op::MOV_W_SD:
+                m.write16(rn - 2, static_cast<std::uint16_t>(rm));
                 rn -= 2;
-                m.write16(rn, static_cast<std::uint16_t>(rm));
                 break;
             case Op::MOV_L_SD:
+                m.write32(rn - 4, rm);
                 rn -= 4;
-                m.write32(rn, rm);
                 break;
             case Op::MOV_B_LI: {
                 const std::uint32_t v = sx8(m.read8(rm));

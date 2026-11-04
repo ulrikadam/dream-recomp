@@ -1310,12 +1310,16 @@ private:
                 return ldsx(rn, "m.read16(" + rm + ")", 2, "std::int16_t");
             case Op::MOV_L_L:
                 return rn + " = m.read32(" + rm + ");";
+            // Rm is read before Rn moves: `mov.l r15,@-r15` stores the old r15 (the manual's MOVLM
+            // writes R[m] to R[n]-4, then decrements). GCC passes struct-return pointers this way.
             case Op::MOV_B_SD:
-                return rn + " -= 1; m.write8(" + rn + ", static_cast<std::uint8_t>(" + rm + "));";
+                return "m.write8(" + rn + " - 1, static_cast<std::uint8_t>(" + rm + ")); " + rn +
+                       " -= 1;";
             case Op::MOV_W_SD:
-                return rn + " -= 2; m.write16(" + rn + ", static_cast<std::uint16_t>(" + rm + "));";
+                return "m.write16(" + rn + " - 2, static_cast<std::uint16_t>(" + rm + ")); " + rn +
+                       " -= 2;";
             case Op::MOV_L_SD:
-                return rn + " -= 4; m.write32(" + rn + ", " + rm + ");";
+                return "m.write32(" + rn + " - 4, " + rm + "); " + rn + " -= 4;";
             case Op::MOV_B_LI:
                 return ldsx(rn, "m.read8(" + rm + ")", 1, "std::int8_t") +
                        (n != m ? " " + rm + " += 1;" : "");

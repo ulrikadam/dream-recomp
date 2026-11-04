@@ -43,7 +43,7 @@ Representative forms:
 | `add r1,r2` | `c.r[2] += c.r[1];` |
 | `addc r1,r2` | `{ uint32_t a = c.r[2], s = a + c.r[1] + c.t; c.t = (s < a) \|\| (c.t && s == a); c.r[2] = s; }` |
 | `mov.l @(4,r14),r3` | `c.r[3] = m.read32(c.r[14] + 4);` |
-| `mov.l r0,@-r15` | `c.r[15] -= 4; m.write32(c.r[15], c.r[0]);` |
+| `mov.l r0,@-r15` | `m.write32(c.r[15] - 4, c.r[0]); c.r[15] -= 4;` |
 | `mov.l 0x8c010f80,r1` (PC-relative literal) | `c.r[1] = 0x0c020000u;` when the pool word is in the image and not written at runtime; otherwise `m.read32(0x8c010f80)` |
 | `cmp/hs r1,r2` | `c.t = c.r[2] >= c.r[1];` |
 | `shad r1,r2` | helper `sh4_shad(c.r[2], c.r[1])` (sign-dependent direction, 32-bit special case) |
@@ -81,6 +81,18 @@ The slot instruction is emitted before the branch takes effect but after the bra
 target have been captured into locals, which is what the hardware does. The two hazards the Initial D
 project hit are tested explicitly: a slot that modifies the register the branch reads (`jsr @r1; mov
 r2,r1`) and a slot after `rts` that must still execute before the return.
+
+## A pre-decrement store reads its source first (2026-11-04)
+
+`mov.{b,w,l} Rm,@-Rn` writes the value Rm had *before* Rn moves, then decrements Rn (the manual's
+MOVLM: `Write_Long(R[n]-4, R[m]); R[n] -= 4`). It only matters when m = n, and GCC does exactly
+that to pass a struct-return pointer: `jsr @r3; mov.l r15,@-r15` pushes the address of the space
+the caller just reserved. The emitter and the interpreter both decremented first and so pushed an
+address 4 bytes too low: every returned struct landed one word early and the caller read
+(y, z, garbage) instead of (x, y, z). In Virtua Tennis that is the player's position in the
+visibility test (`fn_0c01bf4c`), so the camera saw the players behind it or far off screen and
+skipped them: the intro showed their bags walking alone and the player select was empty. Both lower
+the store as write-then-decrement now; `test_emit.cpp` and `test_devinterp.cpp` hold the case.
 
 ## Memory access
 

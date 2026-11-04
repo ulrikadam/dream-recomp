@@ -128,6 +128,30 @@ TEST_CASE("devinterp: the step limit stops a runaway loop") {
     sh4::set_hooks(nullptr);
 }
 
+TEST_CASE("devinterp: a pre-decrement store of its own pointer writes the value from before") {
+    // mov.l r15,@-r15 ; mov.w r1,@-r1 ; mov.b r2,@-r2 ; rts ; nop. GCC pushes a struct-return
+    // pointer with the first one (Virtua Tennis); storing the decremented r15 put every returned
+    // vector 4 bytes off.
+    System sys;
+    sys.install();
+    auto& c = sys.ctx;
+    put(sys.memory, 0x8C020000u, {0x2FF6u, 0x2115u, 0x2224u, 0x000Bu, 0x0009u});
+    c.r[15] = 0x8C100010u;
+    c.r[1] = 0x8C100022u;
+    c.r[2] = 0x8C100031u;
+    c.pr = 0x8C00FFF0u;
+    c.pc = 0x8C020000u;
+    devinterp::Options opt;
+    CHECK(devinterp::run(c, sys.memory, 0x8C00FFF0u, opt, nullptr) == devinterp::Stop::Returned);
+    CHECK(c.r[15] == 0x8C10000Cu);
+    CHECK(sys.memory.read32(0x8C10000Cu) == 0x8C100010u);
+    CHECK(c.r[1] == 0x8C100020u);
+    CHECK(sys.memory.read16(0x8C100020u) == 0x0022u);
+    CHECK(c.r[2] == 0x8C100030u);
+    CHECK(sys.memory.read8(0x8C100030u) == 0x31u);
+    sh4::set_hooks(nullptr);
+}
+
 TEST_CASE("devinterp: entered by a jump, an outer RTS elsewhere leaves as a non-local return") {
     // Translated code reached this with a jmp after an earlier call left PR stale, so return_to
     // is not where the code goes back to: its own epilogue pops the real return address. An

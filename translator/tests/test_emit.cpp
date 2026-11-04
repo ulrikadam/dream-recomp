@@ -47,6 +47,14 @@ TEST_CASE("emit: LDTLB is lowered to the memory's TLB load, not left to fault") 
     CHECK(r.source.find("m.ldtlb();") != std::string::npos);
 }
 
+TEST_CASE("emit: a pre-decrement store of its own pointer writes the value from before") {
+    // mov.l r15,@-r15 / rts / nop: GCC pushes a struct-return pointer this way, and the SH-4
+    // stores r15 as it was before the decrement.
+    const Image img = image_of(0x0C010000, {0x2FF6, 0x000B, 0x0009});
+    const auto r = emit_unit(img, {FunctionSpec{img.base, img.base + 6, "pushsp"}}, EmitOptions{});
+    CHECK(r.source.find("m.write32(c.r[15] - 4, c.r[15]); c.r[15] -= 4;") != std::string::npos);
+}
+
 TEST_CASE("emit: a store into the image's own pool is still found") {
     // mov.l @(4,pc),r1 (the pool word at +8) / mov.l r0,@r1 / rts / nop / pool: base + 8
     const std::uint32_t base = 0x0C010000, pool = base + 8;
