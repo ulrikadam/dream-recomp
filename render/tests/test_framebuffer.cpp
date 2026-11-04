@@ -275,6 +275,49 @@ TEST_CASE("framebuffer: the clip registers size the written frame") {
     CHECK(info.height == 240);
 }
 
+TEST_CASE("framebuffer: a render writes no wider than its rows and no more than its tiles") {
+    // Virtua Tennis: a 640x480 scene rendered into a texture whose rows are 640 pixels apart,
+    // with the clip left at 1024x512. Taken from the clip alone, the write ran over a megabyte.
+    Regs r;
+    r.write_control(1);  // RGB565
+    r.write_address(0x01000000u | 0x48A800u);
+    r.write_clip(1023, 511);
+    r.write_stride(0xA0);  // 1280 bytes: 640 pixels
+    FramebufferInfo info;
+    REQUIRE(describe_write_framebuffer(r.words.data(), 640, 480, info));
+    CHECK(info.texture);
+    CHECK(info.width == 640);  // the row, not the clip
+    CHECK(info.modulus == 0);
+    CHECK(info.height == 512);  // without the tiles, the clip is all there is to go on
+
+    // A region array of 20x15 tiles, five words an entry, the last one flagged.
+    std::vector<u32> vram(0x2000, 0);
+    const u32 base = 0x1000;
+    r.words[0x02C / 4] = base;
+    u32 at = base / 4;
+    for (u32 y = 0; y < 15; ++y)
+        for (u32 x = 0; x < 20; ++x, at += 5) vram[at] = (y << 8) | (x << 2);
+    vram[at - 5] |= 0x80000000u;
+    auto read32 = [&](u32 a) { return a / 4 < vram.size() ? vram[a / 4] : 0u; };
+    TileExtent tiles = region_extent(r.words.data(), read32);
+    CHECK(tiles.width == 640);
+    CHECK(tiles.height == 480);
+    REQUIRE(describe_write_framebuffer(r.words.data(), 640, 480, info, &tiles));
+    CHECK(info.width == 640);
+    CHECK(info.height == 480);
+
+    // Six words an entry when FPU_PARAM_CFG asks for a punch-through pointer; a tile flagged "no
+    // writeout" is drawn but not written, so it does not count.
+    std::fill(vram.begin(), vram.end(), 0u);
+    r.words[0x07C / 4] = 1u << 21;
+    vram[base / 4] = (0u << 8) | (0u << 2);
+    vram[base / 4 + 6] = (7u << 8) | (7u << 2);
+    vram[base / 4 + 12] = 0x80000000u | (1u << 28) | (20u << 8) | (30u << 2);
+    tiles = region_extent(r.words.data(), read32);
+    CHECK(tiles.width == 256);
+    CHECK(tiles.height == 256);
+}
+
 TEST_CASE("framebuffer: ARGB4444 survives the round trip") {
     std::vector<std::uint8_t> vram(4096, 0);
     Regs r;

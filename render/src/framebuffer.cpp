@@ -25,6 +25,8 @@ constexpr std::size_t kFbWSof1 = 0x060 / 4;
 constexpr std::size_t kFbWLineStride = 0x04C / 4;
 constexpr std::size_t kFbXClip = 0x068 / 4;
 constexpr std::size_t kFbYClip = 0x06C / 4;
+constexpr std::size_t kRegionBase = 0x02C / 4;
+constexpr std::size_t kFpuParamCfg = 0x07C / 4;
 
 constexpr u32 ctrl_enable(u32 w) {
     return w & 1u;
@@ -175,8 +177,31 @@ bool decode_framebuffer(const FramebufferInfo& info, const std::uint8_t* vram,
     return true;
 }
 
+TileExtent region_extent(const std::uint32_t* pvr_regs,
+                         const std::function<std::uint32_t(std::uint32_t)>& read32) {
+    TileExtent e;
+    const u32 base = pvr_regs[kRegionBase] & 0x007FFFFCu;
+    const u32 words = (pvr_regs[kFpuParamCfg] & (1u << 21)) ? 6u : 5u;
+    u32 columns = 0, rows = 0;
+    // A region array has at most one entry per tile of a 2048x2048 frame and usually one per tile
+    // of the screen; the bound keeps a corrupt one from running through all of video memory.
+    for (u32 i = 0; i < 64u * 64u; ++i) {
+        const u32 control = read32(base + i * words * 4u);
+        if ((control & (1u << 28)) == 0) {  // written out
+            columns = std::max(columns, ((control >> 2) & 0x3Fu) + 1u);
+            rows = std::max(rows, ((control >> 8) & 0x3Fu) + 1u);
+        }
+        if (control & 0x80000000u)  // the last region
+            break;
+    }
+    e.width = columns * 32u;
+    e.height = rows * 32u;
+    return e;
+}
+
 bool describe_write_framebuffer(const std::uint32_t* pvr_regs, std::uint32_t width,
-                                std::uint32_t height, FramebufferInfo& out) {
+                                std::uint32_t height, FramebufferInfo& out,
+                                const TileExtent* tiles) {
     out = FramebufferInfo{};
     // FB_X_CLIP and FB_Y_CLIP are the region the hardware is allowed to write, so they size the
     // written frame better than the display does. The caller's size is the fallback for a title
@@ -186,6 +211,11 @@ bool describe_write_framebuffer(const std::uint32_t* pvr_regs, std::uint32_t wid
     if (x_max != 0 && y_max != 0) {
         width = x_max + 1u;
         height = y_max + 1u;
+    }
+    // Only the tiles rendered are written, however large the clip.
+    if (tiles && tiles->width != 0 && tiles->height != 0) {
+        width = std::min(width, tiles->width);
+        height = std::min(height, tiles->height);
     }
     if (width == 0 || height == 0)
         return false;
@@ -210,16 +240,19 @@ bool describe_write_framebuffer(const std::uint32_t* pvr_regs, std::uint32_t wid
     out.alpha_threshold = (pvr_regs[kFbWCtrl] >> 8) & 0xFFu;
     out.texture = (pvr_regs[kFbWSof1] & 0x01000000u) != 0;
     out.address = pvr_regs[kFbWSof1] & 0x00FFFFFFu;
-    out.width = width;
-    out.height = height;
     out.enabled = true;
 
     // FB_W_LINESTRIDE is the distance from one row to the next in eight-byte units. Zero means
     // the rows are packed, which is what a title that renders straight to the display buffer
-    // leaves it at.
+    // leaves it at. A row is never wider than the distance to the next: what would lie past it is
+    // the next row.
     const u32 stride_bytes = (pvr_regs[kFbWLineStride] & 0x1FFu) * 8u;
     const unsigned bpp = bytes_per_pixel(out.format);
     const u32 row_pixels = stride_bytes / bpp;
+    if (row_pixels != 0)
+        width = std::min(width, row_pixels);
+    out.width = width;
+    out.height = height;
     out.modulus = row_pixels > width ? row_pixels - width : 0u;
     return true;
 }

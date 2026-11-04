@@ -286,8 +286,19 @@ struct Live {
             w = display.width;
             h = display.height;
         }
+        // The tiles this render wrote, from its region array, read through the 32-bit view.
+        const std::uint8_t* vram = memory_.vram();
+        const dream::render::TileExtent tiles =
+            dream::render::region_extent(pvr_.reg_block(), [vram](std::uint32_t a) {
+                std::uint32_t v = 0;
+                std::memcpy(&v,
+                            vram + dream::mem::DcMemory::vram_map32(
+                                       a & (dream::mem::DcMemory::kVramSize - 4)),
+                            4);
+                return v;
+            });
         dream::render::FramebufferInfo target;
-        if (!dream::render::describe_write_framebuffer(pvr_.reg_block(), w, h, target))
+        if (!dream::render::describe_write_framebuffer(pvr_.reg_block(), w, h, target, &tiles))
             return;
         if (target.texture) {
             write_texture(target);

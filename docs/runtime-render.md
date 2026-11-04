@@ -396,6 +396,16 @@ so the window keeps the last frame until the next one is drawn. Rez renders a 25
 way between its frames. Without the write-back, the texture kept stale bytes, which showed as
 stripes across Area 1.
 
+**The clip is not the size of what a render writes** (2026-11-04). The hardware writes the tiles the
+region array names, and a row is never wider than `FB_W_LINESTRIDE`. Virtua Tennis renders a
+640x480 scene into a texture for its blurred menu backgrounds with the clip left at 1024x512 and
+rows 640 pixels apart. Sized by the clip, the write covered a megabyte from 0x48A800, and the
+textures the game had packed right after its 640x480 (from 0x520800 on) took the stadium as their
+picture: racket bags turned white, or a mosaic of the crowd. `region_extent` reads the region
+array through the 32-bit view (five words an entry, six with a punch-through pointer, bit 31 the
+last, bit 28 "no writeout") and `describe_write_framebuffer` takes the smallest of the clip, the
+row and the tiles. Textures replaced by a render in a session went from 55 to 7.
+
 **Invalidating what the YUV converter and the texture path wrote** (2026-10-29). A Sofdec video
 decodes every frame into the same texture, so a cache keyed on the address kept the first frame it
 decoded -- before the converter had written anything -- and Rush 2049's intro videos showed as a

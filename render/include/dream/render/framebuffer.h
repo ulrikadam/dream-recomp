@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -54,8 +55,26 @@ bool describe_framebuffer(const std::uint32_t* pvr_regs, FramebufferInfo& out);
 // FB_X_CLIP and FB_Y_CLIP, the region the hardware is allowed to write; the `width` and `height`
 // arguments are the fallback for a title that leaves the clip registers at zero. Returns false for
 // the reserved pixel format.
+//
+// The written frame is also no wider than FB_W_LINESTRIDE says a row is, and no larger than the
+// tiles the render's region array names, when `tiles` gives them: the hardware writes the tiles
+// it rendered, whatever the clip allows. Virtua Tennis renders a 640x480 scene into a texture
+// with the clip left at 1024x512; taking the clip alone wrote a megabyte and covered the textures
+// packed after it.
+struct TileExtent {
+    std::uint32_t width = 0, height = 0;  // pixels; zero when not known
+};
 bool describe_write_framebuffer(const std::uint32_t* pvr_regs, std::uint32_t width,
-                                std::uint32_t height, FramebufferInfo& out);
+                                std::uint32_t height, FramebufferInfo& out,
+                                const TileExtent* tiles = nullptr);
+
+// The extent of the tiles a render writes, from the region array at REGION_BASE: each entry names
+// a 32x32 tile by its column and row, five words long, or six when FPU_PARAM_CFG asks for a
+// punch-through list pointer; bit 31 marks the last, and an entry flagged "no writeout" (bit 28)
+// is drawn but not written. `read32` reads a word of video memory through the 32-bit view, which
+// is how the hardware addresses the region array.
+TileExtent region_extent(const std::uint32_t* pvr_regs,
+                         const std::function<std::uint32_t(std::uint32_t)>& read32);
 
 // Decodes into `out` as RGBA8888, `width * height` pixels, row 0 at the top. Returns false when
 // the framebuffer would read outside video memory.
