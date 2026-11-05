@@ -56,7 +56,8 @@ graph without executing DLL entry points. `--inspect` prints one PE's imports/ex
 binding them; `--audit` lists unsupported imports across available dependencies. Auditing is static:
 it cannot prove that initializers, dynamic imports or forwarded exports will run. With
 `DREAM_DEV_INTERPRETER=OFF`, checking, inspection, auditing and the backend demo remain available;
-`--run` is rejected. The instruction limit applies separately to the main run and each DLL initializer.
+`--run` is rejected. The instruction limit is one budget for the main run, DLL initializers and
+every guest thread (see [Guest threads](#guest-threads)).
 
 For disc inspection, use the Python environment containing `tools/dcdisc`:
 
@@ -178,12 +179,119 @@ ordinals using the actual DLL exports. This is an observed blocker, not a predic
 the remaining functions will make the game work: dynamic calls, COM interface versions, OS initialization
 and timing still need validation. No game binary is included in the source/patch archive.
 
+## Starting Sega Rally 2 (2026-11-05)
+
+`dream-wince --run RALLY2.EXE --lazy` now loads all six modules and runs the title's own code
+up to its first worker thread. `--lazy` links each unsupported COREDLL/DDRAW/DSOUND import to
+a stub that stops the run with the function's name, arguments (and any text they point at) and
+the calling module, so services are written in the order the title really calls them.
+`DREAM_WINCE_WATCH=addr[,addr]` prints the caller of each call to those addresses.
+
+What the start needed, in order, and where it lives (`SystemServices`, trap range 0x1F006000):
+
+| Called by | Service | Behaviour |
+|---|---|---|
+| DLL CRT start-up | `TlsCall` | CE's TlsAlloc/TlsFree entry (Kernel) |
+| OLE32, MGame DLLs | registry `RegOpenKeyExW`, `RegCreateKeyExW`, query/set/enum/info, `RegCloseKey` | in memory, starts empty; a missing key answers ERROR_FILE_NOT_FOUND |
+| WDMLIB, DDHAL | `KernelIoControl`, `QueryAPISetID` | the OAL's interrupt codes (see [The console hardware](#the-console-hardware)), other OEM codes refused; no API set registered ("WDMH") |
+| RALLY2 | `CreateFileW`, `ReadFile`, `SetFilePointer`, `GetFileSize`, `CloseHandle` | the disc folder, read only; `\CD-ROM\` and `\` name its top; `\Device\...` opens a device whose `DeviceIoControl` codes are refused and reported |
+| RALLY2 | windows and messages (`CreateWindowExW`, `PeekMessageW`, `DispatchMessageW`, timers...) | window procedures and timer callbacks run as nested interpreter calls (`Kernel::set_guest_call`) |
+| PLATUTIL | `SetKMode`, `SetProcPermissions`, then the BIOS vectors 0x8C0000B0-E0 | SYSINFO and FLASHROM served from `hle::Flash`, formatted as a European PAL console in French; MISC as `hle/bios.cpp` |
+| RALLY2 | SH-4 port A (PCTRA/PDTRA) | `DreamcastHardware`: VGA cable |
+| RALLY2 | GDI fonts and DCs | handles only, no font installed |
+| DPLAYX | `GetVersionExW` | Windows CE 2.11 (the disc's COREDLL subsystem version) |
+| MGame DLLs | `operator new`/`delete` | COREDLL `malloc`/`free` |
+
+The OS image's registry (`default.fdf` in 0WINCEOS.BIN, 38,776 bytes stored in 38 compressed
+1 KiB blocks) is not decoded: the ROM compression format is undocumented. COM classes are found
+instead by asking the disc's DLLs: a miss on `HKCR\CLSID\{...}\InprocServer32` calls each DLL
+exporting `DllGetClassObject` (MGame* first) for an IClassFactory and records the one that
+answers. So far: input (MGAMEINPUT), registry (MGAMEREGISTRY), vibration (MGAMEVIB). The title's
+own `DllRegisterServer` entries return E_FAIL or E_NOTIMPL, so they cannot fill it.
+
+### Guest threads
+
+`Scheduler` (threads.h) gives each guest thread a host thread of its own, but only the thread
+holding a baton executes: a thread can block anywhere (inside a window procedure or a DLL
+initializer) with its host stack intact, guest state needs no locks, and runs stay
+deterministic. CE scheduling: the highest-priority ready thread runs (0 highest, 7 idle, 3
+normal); equal priorities take turns every 50,000 instructions. `dream-wince` runs every piece
+of guest code in such slices, nested runs included, and `--steps` is one budget for all of them.
+Time is one virtual clock (200 MHz cycles): when every thread waits, it jumps to the earliest
+deadline; when every thread waits with no deadline, the run stops with a deadlock error.
+
+Thread services: `CreateThread` (64 KiB-1 MiB stack, CREATE_SUSPENDED), `ExitThread` (the first
+thread's ends the process), `GetExitCodeThread`, `Suspend`/`ResumeThread`, `TerminateThread`
+(the thread ends where it next runs), `Set`/`GetThreadPriority`, `Sleep` (yields; `Sleep(0)`
+gives up the slice), `GetCurrentThreadId`, and `CloseHandle` on thread handles. Synchronization
+objects follow the calling thread: waits and contended critical sections block, every signal
+(SetEvent, ReleaseMutex, LeaveCriticalSection, a thread exiting) makes waiters check again, and
+thread handles are waitable. TLS values and the last error are per thread. A pulse with
+waiters leaves the event set until a waiter or the next reset clears it: an approximation.
+
+With threads the run got past `CreateThread` and stopped in MGAMED3D.DLL, which reads the
+PowerVR register FB_C_SOF (0xA05F8114) through a kernel-mode accessor: the title's 3D engine
+mixes DirectDraw with direct PowerVR accesses, so graphics cannot stay at the DirectDraw API.
+
+### The console hardware
+
+`--real-directx` runs the disc's own drivers (DDRAW, DDHAL, D3DIM, DSOUND, WDMLIB...) on an
+emulated console instead of the guest DirectX interfaces above: only COREDLL is served by the
+host, and DDRAW/DSOUND imports bind to the disc's modules. `DcHardware` (dc_hardware.h) wires
+the devices as `boot_main` does for a Katana title: PowerVR core and Tile Accelerator, the
+system block (channel-2 DMA), G2 DMA, the AICA with its ARM7 and real-time clock, register
+files for G1, PVR DMA, BSC, UBC, CPG, RTC and SCIF, and the cache arrays. Kernel-mode accesses
+at 0x80000000 and up and `VirtualCopy` windows reach it through `ProcessMemory::set_hardware`.
+DMA buffers (`HalAllocateCommonBuffer`, `MmProbeAndLockPages`) come from console RAM
+0x0C100000-0x0D000000, seen by the process at 0x30000000.
+
+- **Time.** Device events follow the guest clock; when every thread waits, the scheduler
+  advances the devices to their next event (`device_deadline`, `run_devices`), so V-blank and
+  render-done interrupts wake the drivers that wait for them.
+- **Sound.** What the OS image's SYSSTART.EXE does before any title: `ARMCOM.DRV` (after its
+  12-byte header) goes to the start of sound RAM with the ARM7 held in reset, then the ARM7 runs.
+- **Interrupts.** The OAL's routing, read from nk.exe (handler 0x8C02E000, table 0x8C145EA8):
+
+  | SYSINTR | Holly status bits | Source |
+  |---|---|---|
+  | 16 | ISTNRM 0x00080FFF | PowerVR (renders, blanking, TA lists, PVR and ch2 DMA) |
+  | 17 | ISTERR 0xFF | PowerVR/TA errors |
+  | 18 / 19 | ISTNRM 0x3000 / ISTERR 0xF00 | Maple / Maple errors |
+  | 20 / 21 | ISTEXT bit 0 / ISTNRM 0x4000 | GD-ROM / GD-ROM DMA |
+  | 23 / 24 | ISTEXT bit 1 / ISTNRM 0x8000 | AICA / AICA DMA |
+  | 25 | ISTERR 0x00888000 | other errors |
+  | 26 / 27 | ISTEXT bits 2 / 3 | modem / external device |
+
+  `InterruptInitialize` binds an event; a SYSINTR fires once, then waits for `InterruptDone`.
+  Drivers acknowledge through the OAL's `KernelIoControl` codes, each taking the SYSINTR first:
+  0x10000 returns the group's pending status bits and clears them in Holly (the answer is kept
+  until `InterruptDone`), 0x20000 and 0x30000 enable and disable status bits of the group. Only
+  enabled bits raise the SYSINTR. Without them the status was never cleared and the graphics
+  interrupt fired 7,360 times in 66 frames (260 now).
+- **Store queues.** `SetStoreQueueBase(physical)` (nk.exe 0x8C014958) returns 0xE0000000, and
+  from then on the whole store-queue area maps onto `physical` onward: the kernel's TLB miss
+  handler (0x8C012560) loads the 1 MiB page holding each faulting address. DDHAL passes
+  0x0E000000 and writes the region array to 0xE3000200, i.e. 0x11000200 on the bus (video
+  memory through the TA texture path).
+
+Sega Rally 2 now draws its first screen, the memory-card warning, through the disc's own
+drivers: 66 frames and 54 renders in 200 million instructions. `dream-wince` has no renderer, so
+frames are seen offline: `--dump-ta F --dump-ta-at-frame N` saves render N's display list,
+video memory and registers, which `dream_render_view F --vram F.vram` (a build with the
+renderer) draws.
+
+Next: the title then polls the Maple bus device (`\Device\MAPLE` codes 0x2203FC, 0x220400,
+0x22047C, refused) for a pad and a memory card. Also open: the GD-ROM device code 0x25040,
+WDMLIB's `KernelIoControl(1)`, a BIOS MISC call 1 (return to the console menu) during start-up
+that is ignored, and a live window.
+
 ## Validation
 
 `runtime/tests/test_wince_mmu.cpp`, `test_wince_pe.cpp`, `test_wince_media.cpp`,
-`test_wince_modules.cpp`, `test_wince_directx.cpp`, `test_wince_kernel.cpp` and
-`test_wince_synchronization.cpp` use hand-built
-fixtures only. They exercise ASID isolation, all page sizes, permissions, dirty bits, MMU register
+`test_wince_modules.cpp`, `test_wince_directx.cpp`, `test_wince_kernel.cpp`,
+`test_wince_synchronization.cpp`, `test_wince_threads.cpp` (the scheduler: priorities, slices,
+blocking waits, suspension, deadlock) and `test_wince_hardware.cpp` (store queues after
+`SetStoreQueueBase`) use hand-built fixtures only. They exercise ASID isolation, all page sizes, permissions, dirty bits, MMU register
 effects, fault-before-write behavior, virtual instruction fetch, PE rejection cases, rebasing,
 named and ordinal IAT binding, an interpreted PE-to-COREDLL call, surface pixels and PCM samples.
 The ordinary runtime test suite also runs, including the existing Katana memory tests.

@@ -53,6 +53,22 @@ void wait_time(sh4::Ctx& cpu, std::uint32_t milliseconds) {
 }
 }  // namespace
 
+std::uint32_t Synchronization::me() const {
+    return scheduler_ ? scheduler_->current_id() : kThread;
+}
+void Synchronization::signal() {
+    if (scheduler_)
+        scheduler_->notify();
+}
+bool Synchronization::set_event(std::uint32_t handle, bool wake) {
+    const auto it = objects_.find(handle);
+    if (it == objects_.end() || it->second->kind != Kind::Event)
+        return false;
+    it->second->signaled = true;
+    if (wake)
+        signal();
+    return true;
+}
 std::optional<std::uint32_t> Synchronization::resolve(const std::string& name) {
     for (unsigned i = 0; i < kNames.size(); ++i)
         if (kNames[i] == name)
@@ -122,12 +138,17 @@ std::optional<std::uint32_t> Synchronization::poll(std::span<const std::uint32_t
     // Validate the entire list before an auto-reset event or a mutex can be consumed.
     std::set<std::uint32_t> seen;
     for (const auto h : handles) {
-        if (!objects_.contains(h))
+        if (!objects_.contains(h) && !(scheduler_ && scheduler_->owns_handle(h)))
             throw MemoryError(6, "invalid wait handle");
         if (!seen.insert(h).second)
             throw MemoryError(87, "duplicate wait handle");
     }
     for (unsigned i = 0; i < handles.size(); ++i) {
+        if (!objects_.contains(handles[i])) {  // a thread handle
+            if (scheduler_->exited(handles[i]))
+                return i;
+            continue;
+        }
         auto& obj = *objects_.at(handles[i]);
         if (obj.kind == Kind::Event) {
             if (!obj.signaled)
@@ -135,11 +156,11 @@ std::optional<std::uint32_t> Synchronization::poll(std::span<const std::uint32_t
             if (!obj.manual)
                 obj.signaled = false;
         } else {
-            if (obj.owner && obj.owner != kThread)
+            if (obj.owner && obj.owner != me())
                 continue;
             if (obj.recursion == 0xFFFFFFFFu)
                 throw MemoryError(8, "mutex recursion overflow");
-            obj.owner = kThread;
+            obj.owner = me();
             ++obj.recursion;
         }
         return i;
@@ -202,25 +223,38 @@ bool Synchronization::invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target
             store_critical(a, Critical{});
             critical_.erase(a);
         } else if (op == LeaveCritical) {
-            if (state.words[1] != kThread || !state.words[0])
+            if (state.words[1] != me() || !state.words[0])
                 throw std::runtime_error("leaving an unowned CE critical section");
-            if (--state.words[0] == 0)
+            if (--state.words[0] == 0) {
                 state.words[1] = 0;
-            store_critical(a, state);
+                store_critical(a, state);
+                signal();
+            } else {
+                store_critical(a, state);
+            }
         } else {
-            if (state.words[1] && state.words[1] != kThread) {
+            if (state.words[1] && state.words[1] != me()) {
                 if (op == TryCritical) {
                     result = 0;
                     return true;
                 }
-                throw std::runtime_error(
-                    "contended critical section needs a WinCE thread scheduler");
+                if (!scheduler_)
+                    throw std::runtime_error(
+                        "contended critical section needs a WinCE thread scheduler");
+                // Another thread owns it: wait until it is free (or deleted meanwhile).
+                scheduler_->wait(
+                    [&] {
+                        const auto it = critical_.find(a);
+                        return it == critical_.end() || it->second.words[1] == 0;
+                    },
+                    std::nullopt);
             }
-            if (state.words[0] == 0xFFFFFFFFu)
+            auto& owned = critical_at(a);
+            if (owned.words[0] == 0xFFFFFFFFu)
                 throw std::runtime_error("CE critical section recursion overflow");
-            state.words[1] = kThread;
-            ++state.words[0];
-            store_critical(a, state);
+            owned.words[1] = me();
+            ++owned.words[0];
+            store_critical(a, owned);
             if (op == TryCritical)
                 result = 1;
         }
@@ -235,9 +269,8 @@ bool Synchronization::invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target
                 if (op == CreateEvent)
                     result = create(Object{Kind::Event, b != 0, c != 0}, d, last_error);
                 else
-                    result =
-                        create(Object{Kind::Mutex, false, false, b ? kThread : 0u, b ? 1u : 0u}, c,
-                               last_error);
+                    result = create(Object{Kind::Mutex, false, false, b ? me() : 0u, b ? 1u : 0u},
+                                    c, last_error);
                 break;
             case SetEvent:
             case ResetEvent:
@@ -250,17 +283,24 @@ bool Synchronization::invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target
                                                        : 1u;
                 if (action < 1 || action > 3)
                     throw MemoryError(87, "invalid CE EventModify operation");
-                // No other guest thread is waiting. A pulse wakes nobody and leaves it reset.
-                event.signaled = action == 3;
+                // A pulse with waiting threads leaves the event set until one of them (auto
+                // reset) or the next reset (manual) clears it: waiters check again only when
+                // they run, so this approximates "release the waiters, then reset".
+                event.signaled =
+                    action == 3 || (action == 1 && scheduler_ && scheduler_->has_waiters());
+                if (event.signaled)
+                    signal();
                 result = 1;
                 break;
             }
             case ReleaseMutex: {
                 auto& mutex = object(a, Kind::Mutex);
-                if (mutex.owner != kThread)
+                if (mutex.owner != me())
                     throw MemoryError(288, "calling thread does not own this mutex");
-                if (--mutex.recursion == 0)
+                if (--mutex.recursion == 0) {
                     mutex.owner = 0;
+                    signal();
+                }
                 result = 1;
                 break;
             }
@@ -282,11 +322,22 @@ bool Synchronization::invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target
                     }
                     count = a;
                 }
-                const auto ready = poll(std::span<const std::uint32_t>(list.data(), count));
+                const std::span<const std::uint32_t> handles(list.data(), count);
+                auto ready = poll(handles);
+                const auto timeout = op == WaitMultiple ? d : b;
+                if (!ready && scheduler_ && timeout) {
+                    std::optional<std::uint64_t> deadline;
+                    if (timeout != kInfinite)
+                        deadline =
+                            cpu.cycles +
+                            static_cast<std::uint64_t>(std::min(timeout, 0x7FFFFFFFu)) * 200000u;
+                    scheduler_->wait([&] { return (ready = poll(handles)).has_value(); }, deadline);
+                }
                 if (ready)
                     result = *ready;
                 else {
-                    wait_time(cpu, op == WaitMultiple ? d : b);
+                    if (!scheduler_)
+                        wait_time(cpu, timeout);
                     result = kTimeout;
                 }
                 break;

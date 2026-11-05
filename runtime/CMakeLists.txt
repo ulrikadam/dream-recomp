@@ -13,6 +13,10 @@ add_library(dream_runtime STATIC
   src/wince/heap.cpp
   src/wince/kernel_services.cpp
   src/wince/synchronization.cpp
+  src/wince/system_services.cpp
+  src/wince/hardware.cpp
+  src/wince/threads.cpp
+  src/wince/dc_hardware.cpp
   src/wince/modules.cpp
   src/wince/directx.cpp
   src/wince/media.cpp

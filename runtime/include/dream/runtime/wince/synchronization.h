@@ -1,13 +1,20 @@
 #pragma once
 
 #include "dream/runtime/wince/process.h"
+#include "dream/runtime/wince/threads.h"
 
 namespace dream::wince {
-// Synchronization for the current one-thread process. No host thread, blocking wait or
-// invented scheduler: finite unsatisfied waits advance virtual time; infinite ones fault.
+// Synchronization objects. Without a scheduler the process has one thread: finite unsatisfied
+// waits advance virtual time and infinite ones fault. With one (set_scheduler), waits and
+// contended critical sections block the calling guest thread, every signal makes waiting
+// threads check again, and thread handles are waitable (signalled when the thread exits).
 class Synchronization {
 public:
     explicit Synchronization(ProcessMemory& memory) : memory_(memory) {}
+    void set_scheduler(Scheduler* scheduler) { scheduler_ = scheduler; }
+    // The kernel signalling an event (an interrupt for an IST). `wake` makes waiting threads
+    // check again; without it the caller does (the scheduler, from inside its own lock).
+    bool set_event(std::uint32_t handle, bool wake);
     static std::optional<std::uint32_t> resolve(const std::string& name);
     static bool handles(std::uint32_t target);
     bool invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target, std::uint32_t& last_error);
@@ -25,6 +32,9 @@ private:
         std::array<std::uint32_t, 4> words{};
     };
     ProcessMemory& memory_;
+    Scheduler* scheduler_ = nullptr;
+    std::uint32_t me() const;  // the calling thread's id, owner of what it acquires
+    void signal();             // waiting threads check their condition again
     std::map<std::uint32_t, std::shared_ptr<Object>> objects_;
     std::map<std::u16string, std::weak_ptr<Object>> names_;
     std::map<std::uint32_t, Critical> critical_;

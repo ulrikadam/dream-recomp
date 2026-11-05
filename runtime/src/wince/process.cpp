@@ -2,46 +2,51 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <iterator>
 #include <string_view>
 
+#include "dream/runtime/wince/abi.h"
 #include "dream/runtime/wince/kernel_services.h"
 #include "dream/runtime/wince/modules.h"
 #include "dream/runtime/wince/synchronization.h"
+#include "dream/runtime/wince/system_services.h"
 
 namespace dream::wince {
 namespace {
 void valid_range(std::uint32_t a, std::uint32_t n) {
-    if (static_cast<std::uint64_t>(a) + n > 0x80000000ull)
-        throw std::runtime_error("WinCE process address range overflow");
+    if (static_cast<std::uint64_t>(a) + n > 0x80000000ull) {
+        char text[96];
+        std::snprintf(text, sizeof text,
+                      "WinCE process address range overflow at 0x%08x (%u bytes)", a, n);
+        throw std::runtime_error(text);
+    }
 }
-constexpr std::array<std::string_view, 23> kApis = {"GetTickCount",
-                                                    "GetLastError",
-                                                    "SetLastError",
-                                                    "Sleep",
-                                                    "LocalAlloc",
-                                                    "LocalFree",
-                                                    "TlsAlloc",
-                                                    "TlsFree",
-                                                    "TlsGetValue",
-                                                    "TlsSetValue",
-                                                    "GetCurrentProcessId",
-                                                    "GetCurrentThreadId",
-                                                    "ExitProcess",
-                                                    "LoadLibraryW",
-                                                    "LoadLibraryExW",
-                                                    "GetModuleHandleW",
-                                                    "GetProcAddressW",
-                                                    "GetProcAddressA",
-                                                    "CreateEventW",
-                                                    "SetEvent",
-                                                    "ResetEvent",
-                                                    "WaitForSingleObject",
-                                                    "CloseHandle"};
+constexpr std::array<std::string_view, 34> kApis = {
+    "GetTickCount", "GetLastError", "SetLastError", "Sleep", "LocalAlloc", "LocalFree", "TlsAlloc",
+    "TlsFree", "TlsGetValue", "TlsSetValue", "GetCurrentProcessId", "GetCurrentThreadId",
+    "ExitProcess", "LoadLibraryW", "LoadLibraryExW", "GetModuleHandleW", "GetProcAddressW",
+    "GetProcAddressA", "CreateEventW", "SetEvent", "ResetEvent", "WaitForSingleObject",
+    "CloseHandle",
+    // CE's own TLS entry: TlsAlloc and TlsFree are
+    // TlsCall(0, 0) and TlsCall(1, slot) in COREDLL.
+    "TlsCall",
+    // Modules are never unloaded: FreeLibrary
+    // succeeds and the module stays mapped.
+    "FreeLibrary", "GetModuleFileNameW",
+    // Threads (26..33): need a Scheduler.
+    "CreateThread", "ExitThread", "GetExitCodeThread", "ResumeThread", "SuspendThread",
+    "TerminateThread", "SetThreadPriority", "GetThreadPriority"};
 std::string api_name(std::string name) {
     if (name == "LoadLibrary" || name == "LoadLibraryEx" || name == "GetModuleHandle" ||
-        name == "GetProcAddress" || name == "CreateEvent" || name == "CreateMutex")
+        name == "GetProcAddress" || name == "CreateEvent" || name == "CreateMutex" ||
+        name == "GetModuleFileName")
         name += 'W';
+    // C++ operator new and delete are COREDLL's malloc and free.
+    if (name == "??2@YAPAXI@Z")
+        return "malloc";
+    if (name == "??3@YAXPAX@Z")
+        return "free";
     return name;
 }
 std::u16string wide_string(Memory& m, std::uint32_t p, unsigned limit = 260) {
@@ -75,6 +80,11 @@ std::string symbol_string(Memory& m, std::uint32_t p, bool wide) {
         result += static_cast<char>(v);
     }
     throw std::invalid_argument("unterminated export name");
+}
+// "\Windows\FOO.DLL" -> "FOO.DLL": modules are found by file name; the disc is one folder.
+std::string basename(const std::string& path) {
+    const auto at = path.find_last_of("\\/");
+    return at == std::string::npos ? path : path.substr(at + 1);
 }
 std::string lower(std::string s) {
     for (auto& c : s)
@@ -131,6 +141,34 @@ void ProcessMemory::install(const Image& image) {
     used_ += bytes;
 }
 
+void ProcessMemory::map_window(std::uint32_t base, std::uint32_t size, std::uint32_t target) {
+    valid_range(base, size);
+    // A later VirtualCopy over the same pages replaces the earlier mapping of them.
+    std::erase_if(windows_, [&](const auto& w) {
+        return base < w.first + w.second.size && w.first < base + size;
+    });
+    windows_.emplace(base, Window{size, target});
+}
+std::optional<std::uint32_t> ProcessMemory::window_target(std::uint32_t a) const {
+    if (windows_.empty())
+        return std::nullopt;
+    auto it = windows_.upper_bound(a);
+    if (it == windows_.begin())
+        return std::nullopt;
+    --it;
+    if (a - it->first >= it->second.size)
+        return std::nullopt;
+    return it->second.target + (a - it->first);
+}
+bool ProcessMemory::map_fixed(std::uint32_t base, std::uint32_t size, unsigned permissions) {
+    valid_range(base, size);
+    for (const auto& [b, r] : regions_)
+        if (base < b + r.bytes.size() && b < base + size)
+            return false;
+    regions_.emplace(base, Region{std::vector<std::uint8_t>(size), permissions, false, base});
+    used_ += size;
+    return true;
+}
 std::uint32_t ProcessMemory::allocate(std::uint32_t bytes) {
     if (!bytes)
         bytes = 1;
@@ -165,17 +203,22 @@ bool ProcessMemory::release(std::uint32_t base) {
 }
 void ProcessMemory::check(std::uint32_t a, std::uint32_t size, unsigned permission) const {
     valid_range(a, size);
+    auto fail = [&](const char* what) {
+        char text[96];
+        std::snprintf(text, sizeof text, "%s at 0x%08x", what, a);
+        throw std::runtime_error(text);
+    };
     while (size) {
         auto it = regions_.upper_bound(a);
         if (it == regions_.begin())
-            throw std::runtime_error("unmapped WinCE process address");
+            fail("unmapped WinCE process address");
         --it;
         const auto offset = a - it->first;
         const auto& r = it->second;
         if (offset >= r.bytes.size())
-            throw std::runtime_error("unmapped WinCE process address");
+            fail("unmapped WinCE process address");
         if ((r.permissions & permission) != permission)
-            throw std::runtime_error("WinCE page protection violation");
+            fail("WinCE page protection violation");
         const auto n = std::min(size, static_cast<std::uint32_t>(r.bytes.size()) - offset);
         a += n;
         size -= n;
@@ -212,6 +255,20 @@ void ProcessMemory::write_bytes(std::uint32_t a, std::span<const std::uint8_t> b
 std::uint64_t ProcessMemory::load(std::uint32_t a, unsigned size, unsigned permission) const {
     if (a & (std::min(size, 4u) - 1u))
         throw std::runtime_error("unaligned SH-4 process read");
+    if (size == 4 && permission == Read)
+        if (const auto it = fixed_.find(a); it != fixed_.end())
+            return it->second;
+    if (a >= 0x80000000u && hardware_ && permission == Read) {
+        std::uint64_t value = 0;
+        if (hardware_->read(a, size, value))
+            return value;
+    }
+    if (const auto target = window_target(a); target && permission == Read) {
+        std::uint64_t value = 0;
+        if (!hardware_ || !hardware_->read(*target, size, value))
+            throw std::runtime_error("VirtualCopy window onto hardware that is not emulated");
+        return value;
+    }
     check(a, size, permission);
     std::uint64_t value = 0;
     for (unsigned i = 0; i < size; ++i) {
@@ -223,6 +280,13 @@ std::uint64_t ProcessMemory::load(std::uint32_t a, unsigned size, unsigned permi
 void ProcessMemory::store(std::uint32_t a, std::uint64_t v, unsigned size) {
     if (a & (std::min(size, 4u) - 1u))
         throw std::runtime_error("unaligned SH-4 process write");
+    if (a >= 0x80000000u && hardware_ && hardware_->write(a, size, v))
+        return;
+    if (const auto target = window_target(a)) {
+        if (!hardware_ || !hardware_->write(*target, size, v))
+            throw std::runtime_error("VirtualCopy window onto hardware that is not emulated");
+        return;
+    }
     std::array<std::uint8_t, 8> bytes{};
     for (unsigned i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(v >> (8 * i));
     write_bytes(a, std::span<const std::uint8_t>(bytes.data(), size));
@@ -254,14 +318,26 @@ void ProcessMemory::write32(std::uint32_t a, std::uint32_t v) {
 void ProcessMemory::write64(std::uint32_t a, std::uint64_t v) {
     store(a, v, 8);
 }
-void ProcessMemory::sq_write32(std::uint32_t, std::uint32_t) {
-    throw std::runtime_error("store queues unavailable in HLE process");
+void ProcessMemory::sq_write32(std::uint32_t a, std::uint32_t v) {
+    if (!hardware_ || !hardware_->store_queue_write(a, v))
+        throw std::runtime_error("store queues unavailable in HLE process");
 }
-void ProcessMemory::sq_flush(std::uint32_t) {
-    throw std::runtime_error("store queues unavailable in HLE process");
+void ProcessMemory::sq_flush(std::uint32_t a) {
+    if (!hardware_ || !hardware_->store_queue_flush(a))
+        throw std::runtime_error("store queues unavailable in HLE process");
 }
 
 std::optional<std::uint32_t> Kernel::resolve(const Import& imp) const {
+    // WDMLIB's DMA buffer calls go through the device manager's API set, which no process
+    // provides here: the kernel serves them from the emulated console RAM instead.
+    if (lower(imp.dll) == "wdmlib.dll") {
+        if (!imp.ordinal &&
+            ((imp.name.starts_with("Hal") && imp.name.find("CommonBuffer") != std::string::npos) ||
+             imp.name == "MmProbeAndLockPages" || imp.name == "MmUnlockPages" ||
+             imp.name == "HalMapInterrupt"))
+            return SystemServices::resolve(imp.name);
+        return {};
+    }
     if (lower(imp.dll) != "coredll.dll")
         return {};
     auto name = imp.name;
@@ -277,11 +353,14 @@ std::optional<std::uint32_t> Kernel::resolve(const Import& imp) const {
             return kTrapBase + static_cast<std::uint32_t>(i) * 4;
     if (const auto sync = Synchronization::resolve(name))
         return sync;
+    if (const auto system = SystemServices::resolve(name))
+        return system;
     return KernelServices::resolve(name);
 }
 void Kernel::bind_ordinal(std::uint16_t ordinal, const std::string& name) {
     if (std::find(kApis.begin(), kApis.end(), api_name(name)) == kApis.end() &&
-        !KernelServices::resolve(api_name(name)) && !Synchronization::resolve(api_name(name)))
+        !KernelServices::resolve(api_name(name)) && !Synchronization::resolve(api_name(name)) &&
+        !SystemServices::resolve(api_name(name)))
         throw std::invalid_argument("unsupported COREDLL ordinal target");
     const auto it = ordinals_.find(ordinal);
     if (it != ordinals_.end() && it->second != name)
@@ -294,23 +373,102 @@ void Kernel::attach_modules(Modules& modules, std::uint32_t main,
     main_module_ = main;
     entry_call_ = std::move(entry);
 }
+void Kernel::set_guest_call(GuestCall call) {
+    guest_call_ = std::move(call);
+    if (system_)
+        system_->set_guest_call(guest_call_);
+}
+void Kernel::set_class_resolver(ClassResolver resolver) {
+    class_resolver_ = std::move(resolver);
+    if (system_)
+        system_->set_class_resolver(class_resolver_);
+}
 Kernel::Kernel() = default;
 Kernel::~Kernel() = default;
 const std::vector<std::u16string>& Kernel::debug_messages() const {
     static const std::vector<std::u16string> empty;
     return services_ ? services_->debug_messages() : empty;
 }
+std::uint32_t Kernel::thread_id() const {
+    return scheduler_ ? scheduler_->current_id() : Scheduler::kMainThread;
+}
+std::uint32_t Kernel::last_error() const {
+    const auto it = errors_.find(thread_id());
+    return it == errors_.end() ? 0 : it->second;
+}
+void Kernel::set_scheduler(Scheduler* scheduler, ProcessMemory* memory) {
+    scheduler_ = scheduler;
+    if (synchronization_)
+        synchronization_->set_scheduler(scheduler);
+    process_ = memory;
+    if (!scheduler || !memory)
+        return;
+    // CE reserves TLS slots 0-2 (message queue, C runtime, kernel): TlsAlloc starts at 3.
+    for (std::uint32_t slot = 0; slot < 3; ++slot) tls_[slot] = 0;
+    if (!memory->map_fixed(kKData & ~0xFFFu, 0x1000, ProcessMemory::Read | ProcessMemory::Write))
+        throw std::runtime_error("KData page overlaps the process");
+    scheduler->on_switch = [this](std::uint32_t id) { point_kdata(id); };
+    point_kdata(scheduler->current_id());
+}
+bool Kernel::deliver_interrupts(std::uint32_t istnrm, std::uint32_t istext, std::uint32_t isterr,
+                                bool wake) {
+    if (!system_ || !synchronization_)
+        return false;
+    bool any = false;
+    for (const auto event : system_->due_interrupts(istnrm, istext, isterr))
+        any |= synchronization_->set_event(event, wake);
+    return any;
+}
+std::map<std::uint32_t, std::uint64_t> Kernel::interrupt_counts() const {
+    return system_ ? system_->interrupt_counts() : std::map<std::uint32_t, std::uint64_t>{};
+}
+std::uint32_t Kernel::tls_block(std::uint32_t thread) {
+    if (const auto it = tls_blocks_.find(thread); it != tls_blocks_.end())
+        return it->second;
+    const auto block = process_ ? process_->allocate(64 * 4) : 0;
+    if (!block)
+        throw std::runtime_error("no guest memory for a thread's TLS array");
+    tls_blocks_[thread] = block;
+    return block;
+}
+// KDataStruct: lpvTls at +0, then ahSys[]: SH_CURTHREAD at +8, SH_CURPROC at +12.
+void Kernel::point_kdata(std::uint32_t thread) {
+    process_->write32(kKData, tls_block(thread));
+    process_->write32(kKData + 8, thread);
+    process_->write32(kKData + 12, kProcessId);
+}
 bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
+    std::uint32_t& last_error_ = errors_[thread_id()];  // GetLastError is per thread
     // Preserve the original v2 event trap addresses while sharing typed handles with mutexes.
     if (target >= kTrapBase + 18 * 4 && target <= kTrapBase + 22 * 4 && !(target & 3u))
         target = *Synchronization::resolve(std::string(kApis[(target - kTrapBase) / 4]));
+    auto* as_process = dynamic_cast<ProcessMemory*>(&memory);
+    if (as_process && !system_) {
+        system_ = std::make_unique<SystemServices>(*as_process);
+        system_->set_root(file_root_);
+        system_->set_guest_call(guest_call_);
+        system_->set_class_resolver(class_resolver_);
+    }
+    // CloseHandle serves file and thread handles as well as synchronization objects.
+    if (target == *Synchronization::resolve("CloseHandle") &&
+        ((system_ && system_->close(c.r[4])) || (scheduler_ && scheduler_->close_handle(c.r[4])))) {
+        c.r[0] = 1;
+        return true;
+    }
     if (Synchronization::handles(target)) {
         auto* process = dynamic_cast<ProcessMemory*>(&memory);
         if (!process)
             throw std::invalid_argument("COREDLL requires a WinCE process address space");
-        if (!synchronization_)
+        if (!synchronization_) {
             synchronization_ = std::make_unique<Synchronization>(*process);
+            synchronization_->set_scheduler(scheduler_);
+        }
         return synchronization_->invoke(c, memory, target, last_error_);
+    }
+    if (SystemServices::handles(target)) {
+        if (!system_)
+            throw std::invalid_argument("COREDLL requires a WinCE process address space");
+        return system_->invoke(c, memory, target, last_error_);
     }
     if (target == kTrapBase + 4 * 4)
         target = *KernelServices::resolve("LocalAlloc");
@@ -330,8 +488,127 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
     if (!process)
         throw std::invalid_argument("COREDLL requires a WinCE process address space");
     auto& result = c.r[0];
-    const auto a = c.r[4], b = c.r[5];
-    switch ((target - kTrapBase) / 4) {
+    auto a = c.r[4], b = c.r[5];
+    auto op = (target - kTrapBase) / 4;
+    if (op == 23) {  // TlsCall(TLS_FUNCALLOC = 0 | TLS_FUNCFREE = 1, slot)
+        if (a > 1) {
+            result = 0xFFFFFFFFu;
+            last_error_ = 87;
+            return true;
+        }
+        op = a == 0 ? 6 : 7;
+        a = b;
+    }
+    if (op == 25) {  // GetModuleFileNameW(hModule, lpFilename, nSize): "\CD-ROM\NAME"
+        result = 0;
+        std::string name;
+        const auto wanted = a ? a : main_module_;
+        if (modules_)
+            for (const auto& [key, module] : modules_->all())
+                if (module.image.base == wanted)
+                    name = key;
+        if (name.empty() || !b) {
+            last_error_ = 6;
+            return true;
+        }
+        std::u16string path = u"\\CD-ROM\\";
+        for (const auto ch : name)
+            path += static_cast<char16_t>(ch >= 'a' && ch <= 'z' ? ch - 32 : ch);
+        const auto size = c.r[6];
+        if (!size)
+            return true;
+        const auto count = std::min<std::size_t>(path.size(), size - 1);
+        for (std::size_t i = 0; i < count; ++i)
+            memory.write16(b + static_cast<std::uint32_t>(i) * 2, path[i]);
+        memory.write16(b + static_cast<std::uint32_t>(count) * 2, 0);
+        result = static_cast<std::uint32_t>(count);
+        return true;
+    }
+    if (op >= 26 && op <= 33) {
+        if (!scheduler_)
+            throw std::runtime_error("guest threads need a scheduler (dream-wince --run)");
+        auto invalid = [&] {
+            last_error_ = 6;  // ERROR_INVALID_HANDLE
+        };
+        switch (op) {
+            case 26: {
+                // CreateThread(lpsa, cbStack, lpStartAddress, lpParameter, dwCreationFlags,
+                // lpThreadId). The stack is the requested size in 64 KiB steps, 64 KiB to 1 MiB.
+                const auto flags = argument(c, memory, 4), id_out = argument(c, memory, 5);
+                const auto size =
+                    std::clamp<std::uint32_t>((b + 0xFFFFu) & ~0xFFFFu, 0x10000u, 0x100000u);
+                const auto stack = process->allocate(size);
+                if (!stack) {
+                    last_error_ = 8;
+                    result = 0;
+                    break;
+                }
+                sh4::Ctx thread{};
+                thread.sr = c.sr;
+                thread.fpscr = c.fpscr;
+                thread.cycles = c.cycles;
+                thread.next_event = c.next_event;
+                thread.pc = c.r[6];
+                thread.r[4] = c.r[7];
+                thread.r[15] = stack + size - 16;  // the four home slots of its first call
+                thread.pr = Scheduler::kThreadReturn;
+                std::uint32_t id = 0;
+                result = scheduler_->create(thread, (flags & 4u) != 0, id);  // CREATE_SUSPENDED
+                if (id_out)
+                    memory.write32(id_out, id);
+                break;
+            }
+            case 27:  // ExitThread(code): the first thread's exit ends the process
+                if (thread_id() == Scheduler::kMainThread)
+                    throw ProcessExit{a};
+                scheduler_->exit_current(a);
+            case 28:  // GetExitCodeThread(h, lpExitCode)
+                if (const auto code = scheduler_->exit_code(a)) {
+                    memory.write32(b, *code);
+                    result = 1;
+                } else {
+                    invalid();
+                    result = 0;
+                }
+                break;
+            case 29:
+            case 30: {  // ResumeThread(h) / SuspendThread(h): previous suspend count
+                const auto previous = op == 29 ? scheduler_->resume(a) : scheduler_->suspend(a);
+                result = previous ? *previous : 0xFFFFFFFFu;
+                if (!previous)
+                    invalid();
+                break;
+            }
+            case 31:  // TerminateThread(h, code)
+                if (scheduler_->owns_handle(a) && thread_id() == Scheduler::kMainThread &&
+                    a == Scheduler::kCurrentThreadHandle)
+                    throw ProcessExit{b};
+                result = scheduler_->terminate(a, b) ? 1 : 0;
+                if (!result)
+                    invalid();
+                break;
+            case 32:  // SetThreadPriority(h, nPriority)
+                result = scheduler_->set_priority(a, static_cast<int>(b)) ? 1 : 0;
+                if (!result)
+                    last_error_ = 87;
+                break;
+            case 33: {  // GetThreadPriority(h)
+                const auto priority = scheduler_->priority(a);
+                result = priority ? static_cast<std::uint32_t>(*priority) : 0x7FFFFFFFu;
+                if (!priority)
+                    invalid();
+                break;
+            }
+        }
+        return true;
+    }
+    if (op == 24) {  // FreeLibrary(hModule)
+        result = a ? 1 : 0;
+        if (!a)
+            last_error_ = 6;
+        return true;
+    }
+    switch (op) {
         case 0:
             result = static_cast<std::uint32_t>(c.cycles / 200000u);
             break;
@@ -341,7 +618,18 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
         case 2:
             last_error_ = a;
             break;
-        case 3:
+        case 3:  // Sleep: with threads, others run meanwhile; Sleep(0) gives up the slice
+            if (scheduler_) {
+                if (a == 0)
+                    scheduler_->yield();
+                else
+                    scheduler_->wait([] { return false; },
+                                     a == 0xFFFFFFFFu
+                                         ? std::nullopt
+                                         : std::optional<std::uint64_t>(
+                                               c.cycles + static_cast<std::uint64_t>(a) * 200000u));
+                break;
+            }
             if (a == 0xFFFFFFFFu)
                 throw std::runtime_error("infinite Sleep needs a scheduler");
             c.cycles += static_cast<std::uint64_t>(a) * 200000u;
@@ -361,10 +649,17 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
             result = static_cast<std::uint32_t>(tls_.erase(a));
             if (!result)
                 last_error_ = 87;
+            std::erase_if(tls_values_, [&](const auto& v) { return v.first.second == a; });
+            if (result && a < 64 && process_)  // a freed slot reads 0 in every thread again
+                for (const auto& [thread, block] : tls_blocks_) process_->write32(block + a * 4, 0);
             break;
-        case 8:
-            if (const auto it = tls_.find(a); it != tls_.end()) {
-                result = it->second;
+        case 8:  // TlsGetValue: each thread has its own value per slot, 0 until set
+            if (tls_.contains(a) && a < 64 && process_) {
+                result = process_->read32(tls_block(thread_id()) + a * 4);
+                last_error_ = 0;
+            } else if (tls_.contains(a)) {
+                const auto it = tls_values_.find({thread_id(), a});
+                result = it == tls_values_.end() ? 0 : it->second;
                 last_error_ = 0;
             } else {
                 result = 0;
@@ -372,8 +667,11 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
             }
             break;
         case 9:
-            if (auto it = tls_.find(a); it != tls_.end()) {
-                it->second = b;
+            if (tls_.contains(a) && a < 64 && process_) {
+                process_->write32(tls_block(thread_id()) + a * 4, b);
+                result = 1;
+            } else if (tls_.contains(a)) {
+                tls_values_[{thread_id(), a}] = b;
                 result = 1;
             } else {
                 result = 0;
@@ -381,10 +679,10 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
             }
             break;
         case 10:
-            result = 1;
+            result = kProcessId;
             break;
         case 11:
-            result = 2;
+            result = thread_id();
             break;
         case 12:
             throw ProcessExit{a};
@@ -393,7 +691,6 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
         case 15:
         case 16:
         case 17: {
-            const auto op = (target - kTrapBase) / 4;
             result = 0;
             if (!modules_) {
                 last_error_ = 120;
@@ -407,11 +704,12 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
                         last_error_ = 120;
                         break;
                     }
-                    const auto h = modules_->load_library(symbol_string(memory, a, true));
+                    const auto h = modules_->load_library(basename(symbol_string(memory, a, true)));
                     modules_->initialize(entry_call_);
                     result = h;
                 } else if (op == 15) {
-                    result = a ? modules_->handle(symbol_string(memory, a, true)) : main_module_;
+                    result = a ? modules_->handle(basename(symbol_string(memory, a, true)))
+                               : main_module_;
                     if (!result)
                         last_error_ = 126;
                 } else {
@@ -424,11 +722,15 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
                     if (!result)
                         last_error_ = 127;
                 }
-            } catch (const PeError&) {
+            } catch (const PeError& e) {
+                // A module a title asks for and cannot have is worth seeing: say which and why.
+                std::fprintf(stderr, "wince: module call %u failed: %s\n", op, e.what());
                 last_error_ = 126;
-            } catch (const std::invalid_argument&) {
+            } catch (const std::invalid_argument& e) {
+                std::fprintf(stderr, "wince: module call %u failed: %s\n", op, e.what());
                 last_error_ = 87;
-            } catch (const std::runtime_error&) {
+            } catch (const std::runtime_error& e) {
+                std::fprintf(stderr, "wince: module call %u failed: %s\n", op, e.what());
                 last_error_ = 998;
             }
             break;

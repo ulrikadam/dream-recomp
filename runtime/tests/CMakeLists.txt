@@ -9,6 +9,8 @@ add_executable(dream_runtime_tests
   test_wince_directx.cpp
   test_wince_kernel.cpp
   test_wince_synchronization.cpp
+  test_wince_threads.cpp
+  test_wince_hardware.cpp
   test_system.cpp
   test_devinterp.cpp
   test_gdrom.cpp
