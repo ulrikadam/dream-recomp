@@ -6,6 +6,16 @@ add_library(dream_runtime STATIC
   src/sh4/abi_bare.cpp
   src/sh4/fsca.cpp
   src/mem/dc_memory.cpp
+  src/mem/mmu_memory.cpp
+  src/wince/pe_loader.cpp
+  src/wince/process.cpp
+  src/wince/virtual_memory.cpp
+  src/wince/heap.cpp
+  src/wince/kernel_services.cpp
+  src/wince/synchronization.cpp
+  src/wince/modules.cpp
+  src/wince/directx.cpp
+  src/wince/media.cpp
   src/sched/scheduler.cpp
   src/sh4/intc.cpp
   src/sh4/tmu.cpp

@@ -2,6 +2,13 @@ add_executable(dream_runtime_tests
   test_main.cpp
   test_fenv.cpp
   test_memory.cpp
+  test_wince_mmu.cpp
+  test_wince_pe.cpp
+  test_wince_media.cpp
+  test_wince_modules.cpp
+  test_wince_directx.cpp
+  test_wince_kernel.cpp
+  test_wince_synchronization.cpp
   test_system.cpp
   test_devinterp.cpp
   test_gdrom.cpp

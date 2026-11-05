@@ -18,6 +18,8 @@ public:
     virtual ~Memory() = default;
     virtual std::uint8_t read8(std::uint32_t addr) = 0;
     virtual std::uint16_t read16(std::uint32_t addr) = 0;
+    // Instruction access may have different permissions from a data read.
+    virtual std::uint16_t fetch16(std::uint32_t addr) { return read16(addr); }
     virtual std::uint32_t read32(std::uint32_t addr) = 0;
     virtual std::uint64_t read64(std::uint32_t addr) = 0;
     virtual void write8(std::uint32_t addr, std::uint8_t v) = 0;

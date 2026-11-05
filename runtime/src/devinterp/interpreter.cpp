@@ -55,7 +55,7 @@ struct Machine {
     const std::uint32_t return_to;
 
     Instr fetch(std::uint32_t pc) {
-        const Instr ins = sh4::decode(m.read16(pc));
+        const Instr ins = sh4::decode(m.fetch16(pc));
         if (st.instructions < trace_budget())
             std::fprintf(stderr,
                          "  interp %08x  %04x  %-28s r0=%08x r15=%08x pr=%08x sr=%08x spc=%08x "
@@ -984,6 +984,13 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 if (t == return_to && ins.op != Op::RTE)
                     return Stop::Returned;
                 const bool computed = ins.op == Op::JMP || ins.op == Op::BRAF || ins.op == Op::RTE;
+                if (computed && ins.op != Op::RTE && opt.hle_call && opt.hle_call(c, m, t)) {
+                    ++st.native_calls;
+                    if (c.pr == return_to) return Stop::Returned;
+                    c.pc = c.pr;
+                    mc.poll();
+                    break;
+                }
                 if (computed && native_ok_for(opt, t)) {
                     if (sh4::GuestFn fn = sh4::find_function(t, &m)) {
                         // Tail call into translated code: it returns to its PR, which is where the
@@ -1007,6 +1014,12 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 break;
             }
             case Flow::Call:
+                if (opt.hle_call && opt.hle_call(c, m, t)) {
+                    ++st.native_calls;
+                    c.pc = pc + 4;
+                    mc.poll();
+                    break;
+                }
                 if (native_ok_for(opt, t)) {
                     if (sh4::GuestFn fn = sh4::find_function(t, &m)) {
                         ++st.native_calls;

@@ -38,6 +38,14 @@ records how far it gets.
 | Crazy Taxi (USA), Rez, Ikaruga | From upstream | Not re-tested here. |
 | Windows CE titles (Sega Rally 2...) | Unsupported | They boot through IP.BIN and run with the MMU on. |
 
+Windows CE development now has an [experimental runtime](docs/wince-support.md): a strict SH-4
+memory adapter, a PE32 DLL loader, a COREDLL HLE subset with guest heaps/virtual pages/CRT services,
+recursive critical sections/mutexes and event waits, and guest DirectDraw/Direct3D/DirectSound
+COM interfaces backed by CPU rendering and PCM mixing. `dream-wince` runs original SH-4 PE fixtures,
+captures their graphics/audio, tests synchronization across an original EXE/DLL pair and audits
+real module imports. Commercial CE titles
+remain unsupported; this path does not yet provide a complete Windows CE or DirectX environment.
+
 **What the fork adds**
 
 - Translator fixes:

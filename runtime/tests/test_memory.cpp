@@ -126,7 +126,7 @@ TEST_CASE("memory: with the MMU on, store queues flush through the UTLB, not QAC
     m.write32(0xF7000000u, 0x10000000u | 0x1BEu);  // entry 0 data: PPN of the TA FIFO
     m.write32(0xF6000100u, 0xE0100000u | 0x100u);  // entry 1: onto RAM
     m.write32(0xF7000100u, 0x0C100000u | 0x1BEu);
-    CHECK(m.read32(0xF6000000u) == (0xE1000000u | 0x100u));
+    CHECK(m.read32(0xF6000000u) == (0xE1000000u | 0x300u));  // V and D mirror data array 1
     m.write32(0xFF000010u, 1u);  // MMUCR.AT
     for (std::uint32_t i = 0; i < 8; ++i) m.sq_write32(0xE0000000u + 4 * i, 0x300u + i);  // SQ0
     for (std::uint32_t i = 0; i < 8; ++i) m.sq_write32(0xE0000020u + 4 * i, 0x400u + i);  // SQ1

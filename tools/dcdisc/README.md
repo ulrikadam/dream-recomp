@@ -25,6 +25,7 @@ pip install -e "tools/dcdisc[test]"    # plus pytest and pycdlib for the synthet
 | `dcdisc new-game IMAGE [ID]` | Set a title up: extract it, and write `games/<id>/<id>.toml` and its `CMakeLists.txt` from the disc's own header. Refuses Windows CE titles, and refuses to overwrite an existing config without `--force` |
 | `dcdisc doctor` | Whether this machine can build and run the project: CMake, compiler, submodule, CHD backend, and the optional Vulkan/SDL3/glslc/clang-format |
 | `dcdisc shortlist IMAGE [IMAGE...]` | One row per disc: boot size, code-file count, streaming volume, WinCE, Katana banners. For choosing a baseline title from a pile of dumps |
+| `dcdisc wince-report IMAGE [--json]` | Read-only inventory of Windows CE kernels and loose PE32 modules; see [Windows CE development](../../docs/wince-support.md) |
 
 `IMAGE` is a `.gdi`, a `.chd` or a `.cdi`. Add `--chdman` to force the chdman backend for a CHD.
 

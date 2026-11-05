@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 #include "dream/runtime/memory.h"
 #include "dream/runtime/sh4/ctx.h"
@@ -35,6 +36,9 @@ struct Options {
     // frames (18 Wheeler, at a byte-table switch the translator did not recover).
     bool leave_on_outer_return = false;
     std::uint64_t max_instructions = 0;  // 0 = unlimited
+    // Optional process-local HLE dispatch. Runs after a call's delay slot with SH-4 arguments
+    // in the context; true means it returned normally, false means interpret the guest target.
+    std::function<bool(sh4::Ctx&, ::dream::Memory&, std::uint32_t)> hle_call;
 };
 
 struct Stats {

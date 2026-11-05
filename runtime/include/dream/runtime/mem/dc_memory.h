@@ -68,14 +68,18 @@ public:
 // The SH-4 unified TLB as its memory-mapped arrays expose it (SH7750 hardware manual 3.7): the
 // address array at 0xF6000000, data array 1 at 0xF7000000 and data array 2 at 0xF7800000, entry n
 // at offset n << 8. Katana's Shinobi fills it through these arrays to map the store-queue area onto
-// the TA FIFO and RAM. Only store-queue flushes translate through it (DcMemory::sq_flush); ASIDs
-// are not compared, which is right for the shared entries that code writes.
+// the TA FIFO and RAM. DcMemory::sq_flush keeps its legacy ASID-independent lookup; the opt-in
+// MmuMemory adapter uses lookup() for CPU translation and protection checks.
 class Utlb final : public MmioHandler {
 public:
     std::uint32_t read(std::uint32_t addr, unsigned size) override;
     void write(std::uint32_t addr, std::uint32_t value, unsigned size) override;
     // The physical address a valid entry maps va to, or false when none does.
     bool translate(std::uint32_t va, std::uint32_t& pa) const noexcept;
+    enum class Result { Hit, Miss, MultipleHit, Protection, InitialWrite };
+    // Strict CPU lookup. ASIDs are ignored only for shared pages or privileged SV mode.
+    Result lookup(std::uint32_t va, std::uint8_t asid, bool privileged, bool sv,
+                  bool write, std::uint32_t& pa) const noexcept;
     void invalidate() noexcept;  // MMUCR.TI
     // What LDTLB does: entry `i` (MMUCR.URC) from PTEH, PTEL and PTEA.
     void load(unsigned i, std::uint32_t pteh, std::uint32_t ptel, std::uint32_t ptea) noexcept;
@@ -242,6 +246,8 @@ public:
     void write64(std::uint32_t a, std::uint64_t v) override;
     void sq_write32(std::uint32_t a, std::uint32_t v) override;
     void sq_flush(std::uint32_t a) override;
+    // Flush to an already translated physical address (used by the strict MMU adapter).
+    void sq_flush_to(std::uint32_t a, std::uint32_t physical);
     void ldtlb() override;
 
     // The 32-bit VRAM view interleaves the two 4 MB banks word by word onto the 64-bit view.

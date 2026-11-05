@@ -10,6 +10,7 @@
     dcdisc descramble IN OUT / scramble IN OUT
     dcdisc scan FILE                      SH-4 code heuristics and SDK banners for one file
     dcdisc shortlist IMAGE [IMAGE...]     one comparison row per disc, for choosing a baseline title
+    dcdisc wince-report IMAGE [--json]     inventory Windows CE PE modules
 """
 
 from __future__ import annotations
@@ -127,6 +128,14 @@ def cmd_inspect(args) -> int:
     else:
         sys.stdout.write(text)
     return 1 if r.wince else 0
+
+
+def cmd_wince_report(args) -> int:
+    from .wince import inspect_wince_image, report_json, report_text
+    with _open(args) as img:
+        report = inspect_wince_image(img)
+    sys.stdout.write(report_json(report) + "\n" if args.json else report_text(report))
+    return 0
 
 
 def cmd_manifest(args) -> int:
@@ -251,6 +260,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--chdman", action="store_true")
     s.add_argument("--fast", action="store_true", help="only code-scan .BIN files")
     s.set_defaults(fn=cmd_shortlist)
+    s = sub.add_parser("wince-report", help="inventory Windows CE SH-4 PE modules")
+    img(s); s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_wince_report)
     s = sub.add_parser("new-game", help="extract a disc and write its config and build file")
     img(s); s.add_argument("id", nargs="?", help="directory and unit name (default: from IP.BIN)")
     s.add_argument("--dir", default="games", help="where games live (default: games)")

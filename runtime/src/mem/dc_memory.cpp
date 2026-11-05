@@ -75,7 +75,7 @@ void Utlb::write(std::uint32_t addr, std::uint32_t value, unsigned size) {
             return;
         }
         addr_[i] = value;  // VPN, D, V, ASID
-        data1_[i] = (data1_[i] & ~kValid) | (value & kValid);
+        data1_[i] = (data1_[i] & ~(kValid | 4u)) | (value & kValid) | ((value >> 7) & 4u);
         return;
     }
     if (addr & 0x00800000u) {
@@ -83,7 +83,7 @@ void Utlb::write(std::uint32_t addr, std::uint32_t value, unsigned size) {
         return;
     }
     data1_[i] = value & 0x1FFFFDFFu;  // PPN, V, SZ1, PR, SZ0, C, D, SH, WT
-    addr_[i] = (addr_[i] & ~kValid) | (value & kValid);
+    addr_[i] = (addr_[i] & ~(kValid | 0x200u)) | (value & kValid) | ((value & 4u) << 7);
 }
 
 bool Utlb::translate(std::uint32_t va, std::uint32_t& pa) const noexcept {
@@ -99,6 +99,30 @@ bool Utlb::translate(std::uint32_t va, std::uint32_t& pa) const noexcept {
         }
     }
     return false;
+}
+
+Utlb::Result Utlb::lookup(std::uint32_t va, std::uint8_t asid, bool privileged, bool sv,
+                          bool write, std::uint32_t& pa) const noexcept {
+    static constexpr std::uint32_t masks[] = {0xFFFFFC00u, 0xFFFFF000u, 0xFFFF0000u,
+                                             0xFFF00000u};
+    int hit = -1;
+    for (unsigned i = 0; i < 64; ++i) {
+        const auto d = data1_[i];
+        if (!(d & kValid)) continue;
+        const auto mask = masks[((d >> 6) & 2u) | ((d >> 4) & 1u)];
+        if ((va & mask) != (addr_[i] & mask)) continue;
+        if (!(d & 2u) && !(privileged && sv) && (addr_[i] & 255u) != asid) continue;
+        if (hit >= 0) return Result::MultipleHit;
+        hit = static_cast<int>(i);
+    }
+    if (hit < 0) return Result::Miss;
+    const auto d = data1_[hit];
+    const auto pr = (d >> 5) & 3u;
+    if ((!privileged && !(pr & 2u)) || (write && !(pr & 1u))) return Result::Protection;
+    if (write && !(d & 4u)) return Result::InitialWrite;
+    const auto mask = masks[((d >> 6) & 2u) | ((d >> 4) & 1u)];
+    pa = (d & 0x1FFFFC00u & mask) | (va & ~mask);
+    return Result::Hit;
 }
 
 void Utlb::load(unsigned i, std::uint32_t pteh, std::uint32_t ptel, std::uint32_t ptea) noexcept {
@@ -453,7 +477,11 @@ void DcMemory::sq_flush(std::uint32_t a) {
             ++sq_tlb_misses;
         }
     }
-    const std::uint32_t* words = sq_[n];
+    sq_flush_to(a, dest);
+}
+
+void DcMemory::sq_flush_to(std::uint32_t a, std::uint32_t dest) {
+    const std::uint32_t* words = sq_[(a >> 5) & 1];
     const Target t = resolve(dest, 4, true);
     if (t.kind == Target::kBytes) {
         if (journaling)

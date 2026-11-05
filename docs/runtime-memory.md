@@ -42,6 +42,12 @@ sizes without comparing ASIDs. A flush that no entry maps raises a TLB miss on h
 takes the QACR route and counts in `sq_tlb_misses`, which the launcher's report prints. Ordinary
 loads and stores are not translated.
 
+The experimental `mem::MmuMemory` adapter adds opt-in translation and protection for CPU data
+and instruction accesses. It wraps this physical bus; DMA keeps using `DcMemory`. Its faults
+are explicit exceptions, and its SQ path does not fall back to QACR after a TLB miss. Both UTLB
+array views now synchronize V and D. See [Windows CE development](wince-support.md) for its scope
+and the remaining CPU exception-delivery work.
+
 ## Devices and faults
 
 `MmioHandler` has `read(addr, size)`, `write(addr, value, size)` and `write_burst`. Sizes are 1, 2 or 4;
