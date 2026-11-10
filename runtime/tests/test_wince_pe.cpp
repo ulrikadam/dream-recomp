@@ -248,6 +248,70 @@ TEST_CASE("WinCE process: image protections allocation reuse and atomic writes")
     CHECK(memory.allocate(0xFFFFFFFF) == 0);
 }
 
+TEST_CASE("WinCE process: writes that change memory outside the quiet window are counted") {
+    // What dream-wince tells a busy-wait from work by: a store inside the window (the thread's
+    // stack) or of the value already there is not work; one that changes memory elsewhere is.
+    ProcessMemory memory;
+    const auto stack = memory.allocate(4096), data = memory.allocate(4096);
+    REQUIRE(stack != 0);
+    REQUIRE(data != 0);
+    memory.set_quiet_window(stack, 4096);
+    const auto before = memory.outside_writes();
+    memory.write32(stack + 16, 1);  // the stack
+    memory.write32(data + 8, 0);    // already 0
+    CHECK(memory.outside_writes() == before);
+    memory.write32(data + 8, 7);
+    CHECK(memory.outside_writes() == before + 1);
+    memory.write32(data + 8, 7);  // the same again
+    CHECK(memory.outside_writes() == before + 1);
+    memory.write8(data + 9, 1);
+    CHECK(memory.outside_writes() == before + 2);
+    CHECK(memory.device_reads() == 0);
+}
+
+TEST_CASE("WinCE process: remembered regions stay right across many regions and a release") {
+    // More regions than the cache has places, so some share one: every access must still reach
+    // its own region, and a released one must fault rather than read its old bytes.
+    ProcessMemory memory;
+    std::vector<std::uint32_t> blocks;
+    for (std::uint32_t i = 0; i < 300; ++i) {
+        const auto p = memory.allocate(4096);
+        REQUIRE(p != 0);
+        memory.write32(p + 8, i);
+        blocks.push_back(p);
+    }
+    for (int pass = 0; pass < 2; ++pass)
+        for (std::uint32_t i = 0; i < blocks.size(); i += 37) {
+            CHECK(memory.read32(blocks[i] + 8) == i);
+            CHECK(memory.read32(blocks[(i + 256) % blocks.size()] + 8) == (i + 256) % 300);
+        }
+    REQUIRE(memory.read32(blocks[5] + 8) == 5);
+    REQUIRE(memory.release(blocks[5]));
+    CHECK_THROWS_AS(memory.read32(blocks[5] + 8), std::runtime_error);
+    CHECK_THROWS_AS(memory.write32(blocks[5] + 8, 1), std::runtime_error);
+    CHECK(memory.read32(blocks[6] + 8) == 6);
+}
+
+TEST_CASE("WinCE process: code spans cover executable regions and go stale on a change") {
+    ProcessMemory memory;
+    const auto image = load(fixture());
+    memory.install(image);
+    dream::CodeSpan span;
+    REQUIRE(memory.code_span(image.entry, span));
+    CHECK(span.base <= image.entry);
+    CHECK(image.entry - span.base < span.size);
+    const auto at = image.entry - span.base;
+    CHECK((span.bytes[at] | (span.bytes[at + 1] << 8)) == 0x4F22);
+    REQUIRE(span.generation != nullptr);
+    CHECK(*span.generation == span.at);
+    dream::CodeSpan other;
+    CHECK_FALSE(memory.code_span(image.base, other));  // the headers: not executable
+    const auto p = memory.allocate(4096);
+    REQUIRE(p != 0);
+    CHECK_FALSE(memory.code_span(p, other));  // data
+    CHECK(*span.generation != span.at);       // the allocation may have moved things
+}
+
 TEST_CASE("WinCE COREDLL: heap errors TLS clock and exit") {
     Kernel k;
     ProcessMemory memory;
@@ -291,6 +355,30 @@ TEST_CASE("WinCE COREDLL: heap errors TLS clock and exit") {
 }
 
 #ifdef DREAM_DEV_INTERPRETER
+TEST_CASE("WinCE execution: code that rewrites itself runs as rewritten") {
+    // Fetched in place from the region (ProcessMemory::code_span) and kept decoded: a word
+    // changed after it ran must run as changed. See the devinterp test of the same name.
+    ProcessMemory memory;
+    const auto code = memory.virtual_alloc(0, 4096, 0x3000, 0x40);  // PAGE_EXECUTE_READWRITE
+    REQUIRE(code != 0);
+    const std::uint16_t words[] = {0xE000, 0x7001, 0x8801, 0x8B02, 0x2451,
+                                   0xAFFA, 0x0009, 0x000B, 0x0009};
+    for (std::size_t i = 0; i < std::size(words); ++i)
+        memory.write16(code + static_cast<std::uint32_t>(i * 2), words[i]);
+    dream::sh4::Ctx c{};
+    c.pc = code;
+    c.pr = 0x1EFFFFFC;
+    c.r[4] = code + 2;
+    c.r[5] = 0x7010;
+    c.next_event = ~0ull;
+    dream::devinterp::Options options;
+    options.call_translated = false;
+    options.max_instructions = 64;
+    CHECK(dream::devinterp::run(c, memory, c.pr, options, nullptr) ==
+          dream::devinterp::Stop::Returned);
+    CHECK(c.r[0] == 17);
+}
+
 TEST_CASE("WinCE execution: rebased PE calls imported COREDLL and returns through SH4 ABI") {
     Kernel kernel;
     const auto image =

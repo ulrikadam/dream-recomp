@@ -17,6 +17,7 @@ add_library(dream_runtime STATIC
   src/wince/hardware.cpp
   src/wince/threads.cpp
   src/wince/dc_hardware.cpp
+  src/wince/wdm_host.cpp
   src/wince/modules.cpp
   src/wince/directx.cpp
   src/wince/media.cpp

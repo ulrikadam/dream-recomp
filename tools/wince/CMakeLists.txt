@@ -2,6 +2,26 @@
 add_executable(dream-wince main.cpp)
 target_link_libraries(dream-wince PRIVATE dream::runtime)
 dream_target_defaults(dream-wince)
+# With SDL3, the title's sound is heard: its CD audio from the disc image (cd_audio.cpp) and the
+# AICA's output.
+if(TARGET dream::audio)
+  target_sources(dream-wince PRIVATE cd_audio.cpp)
+  target_link_libraries(dream-wince PRIVATE dream::audio)
+  target_compile_definitions(dream-wince PRIVATE DREAM_WINCE_AUDIO=1)
+endif()
+# With the renderer, --window shows the console live and reads the pad (live.cpp).
+if(TARGET dream::render_vk)
+  target_sources(dream-wince PRIVATE live.cpp)
+  target_link_libraries(dream-wince PRIVATE dream::render_vk)
+  target_compile_definitions(dream-wince PRIVATE DREAM_WINCE_WINDOW=1)
+  if(WIN32)
+    add_custom_command(TARGET dream-wince POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E
+              $<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:dream-wince>>,copy_if_different,true>
+              $<TARGET_RUNTIME_DLLS:dream-wince> $<TARGET_FILE_DIR:dream-wince>
+      COMMAND_EXPAND_LISTS)
+  endif()
+endif()
 if(DREAM_BUILD_TESTS)
   add_test(NAME wince.help COMMAND dream-wince --help)
   if(DREAM_DEV_INTERPRETER)

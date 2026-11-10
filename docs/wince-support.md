@@ -7,7 +7,11 @@ mutexes, CE EventModify/PulseEvent and wait-any, exercised through an original S
 It retains the v4 guest heaps, virtual memory, CRT helpers and corrected stack argument layout
 (argument five at SP+16), the DLL loader and guest DirectX interfaces.
 See [the kernel service contract](wince-kernel.md).
-Sega Rally 2 and other commercial titles remain unsupported in the game launcher.
+The game launcher starts a Windows CE title through `dream-wince` (`--run EXE --lazy
+--real-directx --window --disc IMAGE`, and the card in A1 as `--vmu`) when its configuration
+has a `[wince]` table naming the executable on the extracted disc; such a configuration is
+written by hand, as AJOUTER UN JEU still turns Windows CE discs away. The launcher does not try
+to improve such a title after a session: there is no translation to rebuild.
 
 ## Build and try it
 
@@ -215,8 +219,11 @@ own `DllRegisterServer` entries return E_FAIL or E_NOTIMPL, so they cannot fill 
 holding a baton executes: a thread can block anywhere (inside a window procedure or a DLL
 initializer) with its host stack intact, guest state needs no locks, and runs stay
 deterministic. CE scheduling: the highest-priority ready thread runs (0 highest, 7 idle, 3
-normal); equal priorities take turns every 50,000 instructions. `dream-wince` runs every piece
-of guest code in such slices, nested runs included, and `--steps` is one budget for all of them.
+normal). `dream-wince` runs every piece of guest code in slices of 50,000 instructions, nested
+runs included, and `--steps` is one budget for all of them. At the end of a slice a
+higher-priority thread made ready (an interrupt woke it) takes over at once, but one of equal
+priority only once the running thread has used its quantum, CE's 100 ms: switching at every
+slice interleaved the title's worker threads in orders the console never produces.
 Time is one virtual clock (200 MHz cycles): when every thread waits, it jumps to the earliest
 deadline; when every thread waits with no deadline, the run stops with a deadlock error.
 
@@ -250,6 +257,12 @@ DMA buffers (`HalAllocateCommonBuffer`, `MmProbeAndLockPages`) come from console
   render-done interrupts wake the drivers that wait for them.
 - **Sound.** What the OS image's SYSSTART.EXE does before any title: `ARMCOM.DRV` (after its
   12-byte header) goes to the start of sound RAM with the ARM7 held in reset, then the ARM7 runs.
+  Once the driver says it is ready (the address of its work area, 0x38040, at 0xEC), the system
+  opens SNDCORE first, which leaves the start of the driver's event ring (what 0xE4, its write
+  pointer in the 32-byte ring, held at boot: 0x3E80) at the work area + 8; `DcHardware` does the
+  same at the first device time after. A title's SNDCORE only reads it there (its stream update
+  takes `position - start` as the ring's end index): left at zero, Sega Rally 2 froze after
+  ARCADE.
 - **Interrupts.** The OAL's routing, read from nk.exe (handler 0x8C02E000, table 0x8C145EA8):
 
   | SYSINTR | Holly status bits | Source |
@@ -280,18 +293,219 @@ frames are seen offline: `--dump-ta F --dump-ta-at-frame N` saves render N's dis
 video memory and registers, which `dream_render_view F --vram F.vram` (a build with the
 renderer) draws.
 
-Next: the title then polls the Maple bus device (`\Device\MAPLE` codes 0x2203FC, 0x220400,
-0x22047C, refused) for a pad and a memory card. Also open: the GD-ROM device code 0x25040,
-WDMLIB's `KernelIoControl(1)`, a BIOS MISC call 1 (return to the console menu) during start-up
-that is ignored, and a live window.
+### Drivers: the Maple bus
+
+Pads and memory cards are reached through the disc's own Maple driver, hosted the way
+WDEVICE.EXE hosts it on the console. WDMLIB.DLL is the driver model (objects, IRPs, device
+queues) and loads the drivers listed under `HKLM\WDMDrivers\BuiltIn\<name>` (values `Dll`,
+`Order`, optional `Block`); WDEVICE only starts it and turns file calls on `\Device\...` into
+WDMLIB calls. `WdmHost` (wdm_host.h) reproduces WDEVICE.EXE, read from Sega Rally 2's disc:
+
+- at start, the `Files` object directory (`g_OpenFileDir`), the `Maple` registry entry
+  (`maple.dll`, order 0), then `InitWDM`. `LoadDriver` is `LoadLibraryW`; MAPLE.DLL's DllMain
+  runs `InitWDMDriver` and its `DriverEntry` creates `\Device\Maple`, maps the Maple registers,
+  allocates its DMA buffers and starts its interrupt thread (SYSINTR 18 and 19);
+- `CreateFileW("\Device\X")`: `IoGetDeviceObjectPointer`, then for a synchronous handle a lock
+  event, auto-reset and initially signalled, at file object +52 (WDMLIB takes it around each
+  request), and `ObInsertObject` into `Files`. A device no driver serves (`\Device\CDROM0`)
+  still opens, with its requests refused as before;
+- `DeviceIoControl`, `ReadFile`, `WriteFile` and `CloseHandle`: `ControlWDMDevice`,
+  `ReadWriteWDMDevice` (IRP_MJ_READ 2 / WRITE 3) and `ObRemoveObject` + `CloseWDMDevice`, with
+  WDEVICE's argument and access checks and its status mapping (STATUS_PENDING is
+  ERROR_IO_PENDING, others through `RtlMapStatusToError`).
+
+`DcHardware` carries the Maple bus of the Katana path, with a standard pad in port A and a
+memory card in its first slot, blank and in memory unless `--vmu FILE` names a card image
+(saves are written back to it). The driver sets the V-blank hardware trigger, so the bus runs
+once a frame and a request is answered one or two frames after it is made, as on the console.
+
+What it took, each found by following one failure to its cause:
+
+- the driver's start must come before the title: on the console the bus has been scanned for
+  seconds before a title runs (a card is found frames after its pad). The host lets one second
+  of guest time pass after `InitWDM`; without it the title saw devices arrive while it started
+  and re-created its objects with requests still pending;
+- `AddEventAccess` takes a reference: WDMLIB adds one to a caller's overlapped event, then sets
+  the event and closes that reference when the request completes. Destroying the event at that
+  close left MAPLEDEV.DLL waiting on a dead handle (WAIT_FAILED); it then freed a request buffer
+  the driver was still to fill, which corrupted the next object allocated there;
+- `VirtualFree` removes the `VirtualCopy` windows over the pages it releases (MAPLE.DLL maps
+  video memory once and unmaps it; the window used to capture the next reservation, the title's
+  own heap). `memcpy`, `memset` and the other host-side copies go through windows byte by byte;
+- the memory card answers GetMediaInfo for its screen (48x32 dots, as Flycast does); it used to
+  refuse it, and the driver retried while the title's next request found the card busy;
+- COREDLL's `__int64` helpers (`_muli64`, `_divui64`, `_uitoi64`, comparisons and conversions,
+  values in memory, low word first), used by MGAMESTORAGE and MGAMESOUND.
+
+Result: the title finds its pad, vibration, storage and screen classes, reads 28 blocks of the
+card and leaves the memory-card warning; 400 million instructions run without a fault, with
+548 driver requests (2 failed). The pad has no buttons pressed: there is no window to play in.
+
+Bring-up aids, all environment variables of `dream-wince`:
+
+| Variable | Shows |
+|---|---|
+| `DREAM_WINCE_TRACE_MAPLE=N` | the first N Maple frames other than pad reads and empty ports, with their replies and guest time |
+| `DREAM_WINCE_TRACE_DRIVER=N` | the first N driver requests, their input words and status |
+| `DREAM_WINCE_STATUS=S` | every S seconds: instructions, memory in use, Maple transfers, every thread |
+| `DREAM_WINCE_MODULES=1` | where each module sits |
+| `DREAM_WINCE_REGS=1` | a failing thread's registers |
+| `DREAM_WINCE_PEEK=A[,A]` | words of process memory when the run fails |
+| `DREAM_WINCE_WATCH_WRITE=A[:N]` | each write covering address A, stopping at the Nth |
+| `DREAM_WINCE_WATCH_FREE=A[:N]` | each heap free of a block holding A, stopping at the Nth |
+
+`DREAM_WINCE_WATCH` (calls to host services) now also prints the thread and guest time.
+
+### A live window
+
+`dream-wince --window` (the build with the renderer, `build/tools/wince`; SDL3.dll is copied
+beside it) shows the console live and reads the pad:
+
+```
+dream-wince --run RALLY2.EXE --lazy --real-directx --window --vmu card.bin --disc disc.gdi
+```
+
+It runs until the window is closed or escape is pressed, unless `--steps` asks for a limit.
+`--vmu` names the memory card in the pad, created blank and formatted when the file does not
+exist. The title's threads each run on a host thread of their own while a window answers only
+the thread that made it, so `LiveWindow` (tools/wince/live.cpp) keeps the window, Vulkan and all
+drawing on a thread of its own:
+
+- at each render (the PowerVR's STARTRENDER), the display list goes over with a copy of video
+  memory and of the PowerVR registers, and the texture ranges rewritten since the last render.
+  The window thread draws it as boot_main's `Live::render` does (background plane, guard band,
+  fog, write clip, palette, per-pixel translucency) into a 640x480 offscreen image; a render not
+  yet drawn is replaced by a newer one;
+- at each vertical blank (`DcHardware::on_vblank`, before the Maple bus runs), the buffer the
+  video output scans out is shown: the renderer's drawing when a render was written there,
+  otherwise the pixels the title wrote itself, read from video memory;
+- the pad is read on the window thread through the player's bindings (the file the Katana titles
+  and the launcher share) and goes into the Maple controller at the vertical blank. A press is
+  held for at least three vertical blanks, however short it was: running this slowly, the title
+  reads the pad a few times a second of real time, and a tap between two reads was lost. The
+  first changes of the buttons are written to the log (`wince: pad buttons`).
+
+F12 writes `screenshot-wince-NNN.ppm` in the working directory, as does
+`DREAM_WINCE_SCREENSHOT_AT=N` at the Nth image shown. Not done yet: a render into a texture is
+drawn but not written back to video memory.
+
+The interpreter runs about 60 million guest instructions a second, under a third of the console
+([runtime-devinterp.md](runtime-devinterp.md), Speed; 28 million before), but a title's menus
+need far fewer than the console offers: most of the time they wait for the graphics hardware.
+Sega Rally 2 asks `while (FAILED(d3d->Flip()));` (RALLY2.EXE), and
+DirectDraw answers `DDERR_WASSTILLDRAWING` until the flip happened at the vertical blank: two
+thirds of its instructions were that loop. Nothing changes the answer before the hardware's next
+interrupt, so when one call site gets `DDERR_WASSTILLDRAWING` back twice within 20,000 cycles
+(seen at each RTS through the interpreter's `on_return`), the devices run on to their next
+interrupt (a frame at most, and never past the time a sleeping thread wakes) and the interrupt
+thread it woke runs. The title gets the same answers after fewer polls: run with and without it,
+Sega Rally 2 does the same renders at the same guest times. In its menus 95% of the guest's time
+is skipped so, and without a window it runs about three times faster than the console.
+
+Its races wait for the next frame another way, with a loop that only reads:
+`do n = GetFrameCount(); while (n == last);`, the count kept by the vertical-blank interrupt
+thread; a third of the race's instructions. Such a loop is skipped likewise when a call site gets
+the same R0 back three times within 20,000 cycles and, between each, the call came straight back
+from that site (no other call in between) with the same arguments (R4 to R7), the caller's
+preserved registers (R8 to R15) are unchanged, nothing changed memory outside the stack below the
+caller's frame (`ProcessMemory::outside_writes`: a store of the value already there does not
+count, as MGameD3D rewrites its status each turn), and no service was called and no hardware
+register read (`device_reads`). Each condition was needed: without the loop and argument checks,
+a vector helper several callers share, and a `for` loop keeping its counter on the stack, looked
+the same from inside and the race drew six frames a second. With them, Sega Rally 2 draws the
+same renders in the same frames as without any skipping (`DREAM_WINCE_FRAMES=300` prints the
+renders and host time of every 300 vertical blanks), and its race ran at about 0.6 of the
+console's speed without a window instead of 0.17. What is left there is the work itself: vertex
+transforms in DDHAL and MGameGL. With the interpreter's own speed-ups (fetching and decoding,
+below) the race runs at about 1.2 of the console's speed without a window: 300 frames in about
+4 seconds instead of 9.3, the same renders in the same frames.
+
+`--no-wait-skip` runs the loops as they are (`DREAM_WINCE_NO_POLL_SKIP` keeps the DirectDraw rule
+only); the report's `busy-waits` line counts both kinds of skip.
+
+A window therefore holds the guest to real time: at each vertical blank, `LiveWindow` waits
+while the guest's clock (200 MHz) is ahead of the wall's. A guest more than 100 ms behind (a
+load, a heavy scene) is not made to race to catch up afterwards. Sega Rally 2 shows PRESS START
+BUTTON a few seconds after it starts, and its menus run at the console's pace. In a window
+`DREAM_WINCE_FRAMES` also prints the time spent waiting so (`frames 4200: 300 renders in 5.0 s
+(1.0 s waiting)`): the room left. Its race keeps the console's pace with about a fifth of the
+time to spare (a tenth at the start, every car in view); the loading before it runs at about 0.8.
+
+A window has sound (`--no-audio` turns it off; a run without a window is silent), in two parts
+that the sound device mixes:
+
+- the AICA's output, made by the title's DSOUND on the ARM7 (the effects), goes to an
+  `audio::Sink` sample by sample, on the guest's clock. Where the guest runs slower than the
+  console the device runs dry between blocks (the `gaps` count in the report) and the effects
+  are heard chopped; at the menus' real-time pace, 15 gaps in 6,339 blocks;
+- the CD audio (with `--disc`, below) is played by `CdAudio` (tools/wince/cd_audio.cpp) as the
+  drive plays it on the console: by itself once told to. A thread of its own reads the image's
+  audio sectors (16-bit little-endian stereo PCM, 588 frames a sector) and keeps about 190 ms
+  queued on its own `Sink`, on the host's clock, so the music plays at its speed however slowly
+  the title runs. It stops at the end the title gave or off the audio tracks; the title's volume
+  (`IOCTL_CDROM_SET_VOLUME`, left and right) scales it.
+
+The report's `heard:` line counts the effects' samples, blocks, gaps and drops, and the CD
+sectors played.
+
+The CD-ROM device (`\Device\CDROM0`) has no driver here (WSEGACD.DLL needs a GD-ROM drive),
+but MGameAudio plays the title's music from the disc's audio tracks and waits for its answers:
+refused, it left the main menu black. With `--disc image.gdi` the NT CD-ROM requests are answered
+from the disc's tracks: the table of contents of the high-density area (`IOCTL_CDROM_READ_TOC`;
+MGameAudio insists on track 3 coming first), play, seek, stop, pause, resume and volume. An
+overlapped request answered at once still gets its OVERLAPPED filled and its event set, as the
+title waits on it. `wince: CD audio: play track N` in the log names each track played (Sega
+Rally 2's menus play track 8).
+`ProcessMemory` remembers the regions accesses fell in lately, 256 for data and 256 for
+instruction fetches, each under the 4 KiB page an access was in, so nearly every access skips
+its map lookups. With one region of each, the stack, the heap, a module's data and the code of
+two modules took turns and one access in five took the long way (212 million in a billion
+instructions of Sega Rally 2); now some 3 million do, almost all of them writes to the
+hardware, and the same billion instructions take 36 seconds instead of 52. Reads and writes that
+land in a remembered region are now served without the call into `load`/`store`
+(`quick_read`/`quick_write`, the same checks and counting), and code is not fetched through it
+at all: the interpreter reads it from the region (`code_span`). `DREAM_WINCE_WATCH_WRITE` is read
+once at start-up rather than at every store.
+
+`DREAM_WINCE_PROFILE=N` prints where the time goes: the busiest guest code (the PC each run of
+guest code stopped at, weighed by the instructions it ran, in buckets of N bytes; 16 finds
+loops), the call sites whose polls were skipped, the host's time split between the guest
+services and the console hardware (the rest is the interpreter), the costliest services with
+their calls, and the accesses that took the long way. On Sega Rally 2's menus the services take
+about 1.3 seconds of 36 and the hardware 0.6: the interpreter is what is slow.
+`DREAM_WINCE_PRESS=start@N,...` presses pad buttons at given frames. `DREAM_WINCE_REGS` adds the
+registers to the message of a failure on any thread.
+
+What took Sega Rally 2 from ARCADE to a race:
+
+- the sound driver's event ring (`DcHardware::boot_sound`, above): its SNDCORE froze the screen
+  after ARCADE, its sound thread looping for ever in its stream update (+0x3b28);
+- `SetFilePointer` moves by its 32-bit distance alone, as the console's file systems do:
+  MSELECT.DLL points `lpDistanceToMoveHigh` at a stack word it never sets, and adding it in read
+  its car models from past their end, as zeros (then a pointer below an allocation);
+- `lstrcmpW`/`lstrcmpiW` take a null string as less than any other, as Windows does (the CRT's
+  `wcscmp` does not): RALLY2.EXE's table of a stage's objects leaves a name empty;
+- the compiler's float conversions `_itos` and `_utos` (R4 to FR0) and `_stoi` and `_stou` (FR4
+  to R0, truncated, saturating as FTRC does).
+
+Next for speed: the race keeps the console's pace in a window, with little room at its start;
+what is left is the interpreter's dispatch, one instruction at a time (the WinCE executables are
+not statically recompiled). Also open: the GD-ROM device
+(`\Device\CDROM0`, code 0x25040, served by WSEGACD.DLL once a GD-ROM drive is emulated), WDMLIB's
+`KernelIoControl(1)`, a BIOS MISC call 1 (return to the console menu) during start-up that is
+ignored, and what the title asks when a track ends (not yet seen: a menu track lasts minutes).
 
 ## Validation
 
 `runtime/tests/test_wince_mmu.cpp`, `test_wince_pe.cpp`, `test_wince_media.cpp`,
 `test_wince_modules.cpp`, `test_wince_directx.cpp`, `test_wince_kernel.cpp`,
 `test_wince_synchronization.cpp`, `test_wince_threads.cpp` (the scheduler: priorities, slices,
-blocking waits, suspension, deadlock) and `test_wince_hardware.cpp` (store queues after
-`SetStoreQueueBase`) use hand-built fixtures only. They exercise ASID isolation, all page sizes, permissions, dirty bits, MMU register
+the quantum, blocking waits, suspension, deadlock) and `test_wince_hardware.cpp` (store queues
+after `SetStoreQueueBase`) use hand-built fixtures only; `test_wince_kernel.cpp` also covers
+the `__int64` helpers, `AddEventAccess` references and the CD-ROM requests (the table of
+contents, and play, pause, resume, volume and stop reaching the sound output), and
+`test_vmu_fs.cpp` the card's screen
+media info. They exercise ASID isolation, all page sizes, permissions, dirty bits, MMU register
 effects, fault-before-write behavior, virtual instruction fetch, PE rejection cases, rebasing,
 named and ordinal IAT binding, an interpreted PE-to-COREDLL call, surface pixels and PCM samples.
 The ordinary runtime test suite also runs, including the existing Katana memory tests.
@@ -329,6 +543,6 @@ The clock API is described in [GetTickCount for Windows CE 3.0](https://learn.mi
 The next concrete milestone is extending the verified title's OS startup services and graphics
 requirements, including SH-4 exception/compiler helpers, thread scheduling, files, windows/messages and
 additional DirectX methods.
-Kernel boot is a different path: it first needs CPU fault delivery and ITLB behavior. Keep `new-game` and the
-commercial-game launcher gated until a real executable completes initialization with implemented
-services and repeatable reference checks.
+Kernel boot is a different path: it first needs CPU fault delivery and ITLB behavior. Keep
+`new-game` and the launcher's AJOUTER UN JEU gated for Windows CE discs until titles past Sega
+Rally 2 complete initialization with implemented services and repeatable reference checks.

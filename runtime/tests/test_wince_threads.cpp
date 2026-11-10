@@ -53,6 +53,31 @@ TEST_CASE("wince threads: equal priorities take turns at each yield") {
     CHECK(s.created() == 2);
 }
 
+TEST_CASE("wince threads: a time slice ends a turn only after the quantum, or for a higher one") {
+    std::vector<std::string> log;
+    const std::vector<Script> scripts{[&](Scheduler&, dream::sh4::Ctx&) -> std::uint32_t {
+        log.push_back("worker");
+        return 0;
+    }};
+    dream::sh4::Ctx main{};
+    auto& s = make(scripts, main);
+    const auto h = start(s, 0);
+    main.cycles += Scheduler::kQuantum / 2;
+    s.preempt(Scheduler::kQuantum);  // an equal priority waits for the rest of the quantum
+    CHECK(log.empty());
+    main.cycles += Scheduler::kQuantum / 2;
+    s.preempt(Scheduler::kQuantum);  // used up: the other one runs
+    CHECK(log == std::vector<std::string>{"worker"});
+    join(s, h);
+    // A higher priority made ready does not wait for the quantum.
+    const auto urgent = start(s, 0, true);
+    CHECK(s.set_priority(urgent, 1));
+    CHECK(s.resume(urgent) == 1u);
+    s.preempt(Scheduler::kQuantum);
+    CHECK(log.size() == 2);
+    join(s, urgent);
+}
+
 TEST_CASE("wince threads: a higher priority runs until it waits; suspend and resume") {
     std::vector<std::string> log;
     const std::vector<Script> scripts{[&](Scheduler& s, dream::sh4::Ctx&) -> std::uint32_t {

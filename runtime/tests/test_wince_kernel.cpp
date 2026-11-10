@@ -1,5 +1,9 @@
+#include <filesystem>
+#include <fstream>
+
 #include "dream/runtime/wince/abi.h"
 #include "dream/runtime/wince/heap.h"
+#include "dream/runtime/wince/system_services.h"
 
 #include "doctest.h"
 #include "wince_fixture.h"
@@ -106,6 +110,177 @@ TEST_CASE("WinCE compiler helpers: zero divisors fault without changing results 
         CHECK(g.cpu.r[0] == 0xDEADBEEF);
         CHECK(g.kernel.last_error() == 42);
     }
+}
+
+TEST_CASE("WinCE compiler helpers: 64-bit values live in memory, low word first") {
+    Guest g;
+    const auto get = [&](unsigned offset) {
+        return std::uint64_t{g.m.read32(g.p(offset))} | std::uint64_t{g.m.read32(g.p(offset + 4))}
+                                                            << 32;
+    };
+    const auto put = [&](unsigned offset, std::uint64_t v) {
+        g.m.write32(g.p(offset), static_cast<std::uint32_t>(v));
+        g.m.write32(g.p(offset + 4), static_cast<std::uint32_t>(v >> 32));
+    };
+    // Floats: an integer in R4 to FR0, a float in FR4 to R0, truncated toward zero.
+    g.call("_itos", {0xFFFFFFF3u});
+    CHECK(g.cpu.fr[0] == -13.0f);
+    g.call("_utos", {0x80000000u});
+    CHECK(g.cpu.fr[0] == 2147483648.0f);
+    g.cpu.fr[4] = -13.7f;
+    CHECK(g.call("_stoi") == 0xFFFFFFF3u);
+    g.cpu.fr[4] = 3.0e9f;
+    CHECK(g.call("_stoi") == 0x7FFFFFFFu);  // the nearest bound, as FTRC saturates
+    CHECK(g.call("_stou") == 3000000000u);
+    g.cpu.fr[4] = -0.5f;
+    CHECK(g.call("_stou") == 0u);
+    // From 32 bits: (result*, value).
+    g.call("_uitoi64", {g.p(0), 0xFFFFFFF0u});
+    CHECK(get(0) == 0xFFFFFFF0u);
+    g.call("_itoi64", {g.p(8), 0xFFFFFFF0u});
+    CHECK(get(8) == 0xFFFFFFFFFFFFFFF0ull);  // -16, sign-extended
+    // Arithmetic: (result*, a*, b*). MGameStorage multiplies block counts by block sizes.
+    put(0, 200);
+    put(8, 0x123456789ull);
+    g.call("_muli64", {g.p(16), g.p(0), g.p(8)});
+    CHECK(get(16) == 200 * 0x123456789ull);
+    g.call("_divui64", {g.p(24), g.p(16), g.p(0)});
+    CHECK(get(24) == 0x123456789ull);
+    put(0, static_cast<std::uint64_t>(-7));
+    put(8, 2);
+    g.call("_divi64", {g.p(16), g.p(0), g.p(8)});
+    CHECK(get(16) == static_cast<std::uint64_t>(-3));
+    g.call("_modi64", {g.p(16), g.p(0), g.p(8)});
+    CHECK(get(16) == static_cast<std::uint64_t>(-1));
+    put(0, 0x100000000ull);
+    put(8, 1);
+    g.call("_subui64", {g.p(16), g.p(0), g.p(8)});
+    CHECK(get(16) == 0xFFFFFFFFull);  // the borrow crosses the words
+    g.call("_addui64", {g.p(16), g.p(16), g.p(8)});
+    CHECK(get(16) == 0x100000000ull);
+    // Comparisons: (a*, b*) -> R0. Conversions down: (a*) -> R0, the low word.
+    put(0, static_cast<std::uint64_t>(-1));
+    put(8, 1);
+    CHECK(g.call("_geui64", {g.p(0), g.p(8)}) == 1);
+    CHECK(g.call("_gtui64", {g.p(8), g.p(0)}) == 0);
+    CHECK(g.call("_lti64", {g.p(0), g.p(8)}) == 1);  // -1 < 1 signed
+    CHECK(g.call("_gti64", {g.p(0), g.p(8)}) == 0);
+    put(0, 0x1122334455667788ull);
+    CHECK(g.call("_ui64toui", {g.p(0)}) == 0x55667788u);
+    put(8, 0);
+    CHECK_THROWS_WITH(g.call("_divui64", {g.p(16), g.p(0), g.p(8)}),
+                      "SH-4 division by zero requires WinCE exception dispatch");
+}
+
+TEST_CASE("WinCE events: a driver's AddEventAccess reference outlives one CloseHandle") {
+    // WDMLIB takes a reference to a caller's overlapped event, then sets it and closes that
+    // reference when the request completes: the caller's handle must stay valid.
+    Guest g;
+    const auto event = g.call("CreateEventW", {0, 0, 0, 0});
+    REQUIRE(event);
+    CHECK(g.call("AddEventAccess", {event}) == 1);
+    CHECK(g.call("CloseHandle", {event}) == 1);
+    CHECK(g.call("SetEvent", {event}) == 1);
+    CHECK(g.call("WaitForSingleObject", {event, 0}) == 0);
+    CHECK(g.call("CloseHandle", {event}) == 1);
+    CHECK(g.call("SetEvent", {event}) == 0);  // now gone
+    CHECK(g.kernel.last_error() == 6);
+}
+
+TEST_CASE("WinCE CD-ROM device: the high-density table of contents, answered at once") {
+    // What MGameAudio asks \Device\CDROM0 before it plays a title's music: the table must start
+    // at track 3 (the high-density area), and an overlapped request must still set its event.
+    Guest g;
+    g.wide(0, u"\\Device\\CDROM0");
+    const auto device = g.call("CreateFileW", {g.p(0), 0x80000000u, 0, 0, 3, 0, 0});
+    REQUIRE(device != 0xFFFFFFFFu);
+    g.kernel.system_services()->set_cd_tracks(
+        {{1, 0, true}, {2, 450, false}, {3, 45000, true}, {4, 123868, false}}, 150000);
+    const auto event = g.call("CreateEventW", {0, 1, 0, 0});
+    const auto overlapped = g.p(400);
+    for (unsigned i = 0; i < 20; i += 4) g.m.write32(overlapped + i, 0);
+    g.m.write32(overlapped + 16, event);
+    CHECK(g.call("DeviceIoControl", {device, 0x24000, 0, 1, g.p(100), 804, g.p(96), overlapped}) ==
+          1);
+    CHECK(g.m.read32(g.p(96)) == 28);  // header, tracks 3 and 4, the lead-out
+    CHECK(g.m.read8(g.p(100)) == 0);
+    CHECK(g.m.read8(g.p(101)) == 26);    // what follows the length, big-endian
+    CHECK(g.m.read8(g.p(102)) == 3);     // first track
+    CHECK(g.m.read8(g.p(103)) == 4);     // last track
+    CHECK(g.m.read8(g.p(105)) == 0x14);  // data, ADR 1
+    CHECK(g.m.read8(g.p(106)) == 3);
+    // Absolute MSF of LBA 45000: 45150 frames is 10:02:00.
+    CHECK(g.m.read8(g.p(109)) == 10);
+    CHECK(g.m.read8(g.p(110)) == 2);
+    CHECK(g.m.read8(g.p(111)) == 0);
+    CHECK(g.m.read8(g.p(113)) == 0x10);  // audio
+    CHECK(g.m.read8(g.p(122)) == 0xAA);  // lead-out
+    CHECK(g.m.read32(overlapped + 4) == 28);
+    CHECK(g.call("WaitForSingleObject", {event, 0}) == 0);
+    // The volume, into a byte array at an odd address.
+    CHECK(g.call("DeviceIoControl", {device, 0x24014, 0, 0, g.p(301), 4, g.p(96), 0}) == 1);
+    CHECK(g.m.read8(g.p(301)) == 0xFF);
+    CHECK(g.m.read8(g.p(304)) == 0xFF);
+    // Play, pause, resume, stop and volume reach the sound output, addresses as FADs.
+    struct Heard : CdAudioOutput {
+        std::vector<std::string> calls;
+        void play(std::uint32_t start, std::uint32_t end) override {
+            calls.push_back("play " + std::to_string(start) + " " + std::to_string(end));
+        }
+        void stop() override { calls.push_back("stop"); }
+        void pause() override { calls.push_back("pause"); }
+        void resume() override { calls.push_back("resume"); }
+        void volume(std::uint8_t left, std::uint8_t right) override {
+            calls.push_back("volume " + std::to_string(left) + " " + std::to_string(right));
+        }
+    } heard;
+    g.kernel.system_services()->set_cd_audio(&heard);
+    // Track 4 (LBA 123868) is at 27:33:43; to 27:40:00.
+    const std::uint8_t play[6] = {27, 33, 43, 27, 40, 0};
+    for (unsigned i = 0; i < 6; ++i) g.m.write8(g.p(200 + i), play[i]);
+    const std::uint8_t volume[4] = {0x80, 0x40, 0, 0};
+    for (unsigned i = 0; i < 4; ++i) g.m.write8(g.p(210 + i), volume[i]);
+    CHECK(g.call("DeviceIoControl", {device, 0x24018, g.p(200), 6, 0, 0, g.p(96), 0}) == 1);
+    CHECK(g.call("DeviceIoControl", {device, 0x2400C, 0, 0, 0, 0, g.p(96), 0}) == 1);
+    CHECK(g.call("DeviceIoControl", {device, 0x24010, 0, 0, 0, 0, g.p(96), 0}) == 1);
+    CHECK(g.call("DeviceIoControl", {device, 0x24028, g.p(210), 4, 0, 0, g.p(96), 0}) == 1);
+    CHECK(g.call("DeviceIoControl", {device, 0x24008, 0, 0, 0, 0, g.p(96), 0}) == 1);
+    CHECK(heard.calls == std::vector<std::string>{"play 124018 124500", "pause", "resume",
+                                                  "volume 128 64", "stop"});
+    // A short request is refused.
+    CHECK(g.call("DeviceIoControl", {device, 0x24018, g.p(200), 3, 0, 0, g.p(96), 0}) == 0);
+    CHECK(g.call("DeviceIoControl", {device, 0x24014, 0, 0, g.p(301), 4, g.p(96), 0}) == 1);
+    CHECK(g.m.read8(g.p(301)) == 0x80);
+    g.kernel.system_services()->set_cd_audio(nullptr);
+}
+
+TEST_CASE("WinCE files: SetFilePointer moves by its 32-bit distance alone") {
+    // The console's file systems are 32-bit: the high half a caller points at is not added in,
+    // only written back. Sega Rally 2 leaves garbage there when it seeks into a car model.
+    const auto root = std::filesystem::temp_directory_path() / "dream_wince_files_test";
+    std::filesystem::create_directories(root);
+    {
+        std::ofstream out(root / "DATA.BIN", std::ios::binary);
+        for (int i = 0; i < 256; ++i) out.put(static_cast<char>(i));
+    }
+    Guest g;
+    g.call("GetLastError");  // the services exist from the first call
+    g.kernel.system_services()->set_root(root);
+    g.wide(0, u"\\CD-ROM\\DATA.BIN");
+    const auto file = g.call("CreateFileW", {g.p(0), 0x80000000u, 0, 0, 3, 0, 0});
+    REQUIRE(file != 0xFFFFFFFFu);
+    g.m.write32(g.p(100), 0x12345678u);  // the high half, never set by the caller
+    CHECK(g.call("SetFilePointer", {file, 0x40, g.p(100), 0}) == 0x40u);
+    CHECK(g.m.read32(g.p(100)) == 0);
+    CHECK(g.call("ReadFile", {file, g.p(200), 4, g.p(104), 0}) == 1);
+    CHECK(g.m.read32(g.p(104)) == 4);
+    CHECK(g.m.read32(g.p(200)) == 0x43424140u);
+    g.m.write32(g.p(100), 0xFFFFFFFFu);  // back 8 from the current position, as a 64-bit -8
+    CHECK(g.call("SetFilePointer", {file, 0xFFFFFFF8u, g.p(100), 1}) == 0x3Cu);
+    CHECK(g.call("SetFilePointer", {file, 0xFFFFFFF0u, 0, 2}) == 0xF0u);        // from the end
+    CHECK(g.call("SetFilePointer", {file, 0xFFFFFF00u, 0, 0}) == 0xFFFFFFFFu);  // before 0
+    CHECK(g.call("CloseHandle", {file}) == 1);
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("WinCE heaps: suballocation, reuse, coalescing and API ownership") {
@@ -389,6 +564,11 @@ TEST_CASE("WinCE CRT: byte and UTF16 strings, truncation, padding, search and AS
     CHECK(g.call("_wcsnicmp", {g.p(640), g.p(704), 2}) == 0);
     CHECK(g.call("lstrcmpiW", {g.p(640), g.p(704)}) == 0);
     CHECK_THROWS_AS(g.call("lstrcmpiW", {g.p(512), g.p(512)}), MemoryError);
+    // The Win32 comparisons take a null string as less than any other, as Windows does.
+    CHECK(g.call("lstrcmpiW", {g.p(640), 0}) == 1);
+    CHECK(g.call("lstrcmpW", {0, g.p(640)}) == 0xFFFFFFFFu);
+    CHECK(g.call("lstrcmpiW", {0, 0}) == 0);
+    CHECK_THROWS_AS(g.call("wcscmp", {g.p(640), 0}), std::runtime_error);  // the CRT does not
     CHECK(g.call("CharPrevW", {g.p(512), g.p(516)}) == g.p(514));
     CHECK(g.call("CharPrevW", {g.p(512), g.p(512)}) == g.p(512));
 }

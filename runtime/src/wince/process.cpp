@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <string_view>
 
@@ -42,6 +44,9 @@ std::string api_name(std::string name) {
         name == "GetProcAddress" || name == "CreateEvent" || name == "CreateMutex" ||
         name == "GetModuleFileName")
         name += 'W';
+    // A driver DLL loads like any other: there is no paging to keep it out of here.
+    if (name == "LoadDriver")
+        return "LoadLibraryW";
     // C++ operator new and delete are COREDLL's malloc and free.
     if (name == "??2@YAPAXI@Z")
         return "malloc";
@@ -139,10 +144,12 @@ void ProcessMemory::install(const Image& image) {
     }
     regions_.merge(added);
     used_ += bytes;
+    forget();
 }
 
 void ProcessMemory::map_window(std::uint32_t base, std::uint32_t size, std::uint32_t target) {
     valid_range(base, size);
+    forget();
     // A later VirtualCopy over the same pages replaces the earlier mapping of them.
     std::erase_if(windows_, [&](const auto& w) {
         return base < w.first + w.second.size && w.first < base + size;
@@ -167,6 +174,7 @@ bool ProcessMemory::map_fixed(std::uint32_t base, std::uint32_t size, unsigned p
             return false;
     regions_.emplace(base, Region{std::vector<std::uint8_t>(size), permissions, false, base});
     used_ += size;
+    forget();
     return true;
 }
 std::uint32_t ProcessMemory::allocate(std::uint32_t bytes) {
@@ -190,12 +198,14 @@ std::uint32_t ProcessMemory::allocate(std::uint32_t bytes) {
                      Region{std::vector<std::uint8_t>(bytes), Read | Write, true, candidate});
     used_ += bytes;
     ++allocation_count_;
+    forget();
     return candidate;
 }
 bool ProcessMemory::release(std::uint32_t base) {
     const auto it = regions_.find(base);
     if (it == regions_.end() || !it->second.allocation)
         return false;
+    forget();
     used_ -= static_cast<std::uint32_t>(it->second.bytes.size());
     --allocation_count_;
     regions_.erase(it);
@@ -224,9 +234,60 @@ void ProcessMemory::check(std::uint32_t a, std::uint32_t size, unsigned permissi
         size -= n;
     }
 }
+namespace {
+// DREAM_WINCE_WATCH_WRITE=address[:n]: report each write covering that process address, and stop
+// the run at the nth (a bring-up aid for finding what corrupts an object).
+struct WriteWatch {
+    std::uint32_t address = 0, stop_at = 0, seen = 0;
+    bool on = false;
+    WriteWatch() {
+        if (const char* v = std::getenv("DREAM_WINCE_WATCH_WRITE")) {
+            char* end = nullptr;
+            address = static_cast<std::uint32_t>(std::strtoul(v, &end, 0));
+            if (end && *end == ':')
+                stop_at = static_cast<std::uint32_t>(std::strtoul(end + 1, nullptr, 0));
+            on = true;
+        }
+    }
+    void check(std::uint32_t a, std::uint32_t size, std::uint64_t value) {
+        if (!on || address < a || address - a >= size)
+            return;
+        ++seen;
+        std::fprintf(stderr, "watch-write #%u: 0x%08x (%u bytes at 0x%08x) = 0x%llx\n", seen,
+                     address, size, a, static_cast<unsigned long long>(value));
+        if (seen == stop_at)
+            throw std::runtime_error("watched write");
+    }
+};
+WriteWatch& write_watch() {
+    static WriteWatch watch;
+    return watch;
+}
+// Read once at start-up, so that stores do not ask on every call.
+const bool watching = write_watch().on;
+}  // namespace
+
+bool ProcessMemory::touches_window(std::uint32_t a, std::uint32_t size) const {
+    if (windows_.empty() || !size)
+        return false;
+    // Windows never overlap, so the last one starting in or before the range decides.
+    auto it = windows_.upper_bound(a + (size - 1));
+    if (it == windows_.begin())
+        return false;
+    --it;
+    return it->first + it->second.size > a;
+}
 std::vector<std::uint8_t> ProcessMemory::read_bytes(std::uint32_t a, std::uint32_t size) const {
     if (size > kBudget)
         throw std::runtime_error("WinCE read exceeds memory budget");
+    // A driver's DMA buffer (a VirtualCopy window) read by COREDLL's memcpy: byte by byte.
+    if (touches_window(a, size)) {
+        valid_range(a, size);
+        std::vector<std::uint8_t> result(size);
+        for (std::uint32_t i = 0; i < size; ++i)
+            result[i] = static_cast<std::uint8_t>(load(a + i, 1));
+        return result;
+    }
     check(a, size, Read);
     std::vector<std::uint8_t> result(size);
     for (std::uint32_t i = 0; i < size;) {
@@ -242,34 +303,72 @@ std::vector<std::uint8_t> ProcessMemory::read_bytes(std::uint32_t a, std::uint32
 void ProcessMemory::write_bytes(std::uint32_t a, std::span<const std::uint8_t> bytes) {
     if (bytes.size() > kBudget)
         throw std::runtime_error("WinCE write exceeds memory budget");
+    if (bytes.size() > 8)  // single stores are reported by store()
+        if (watching)
+            write_watch().check(a, static_cast<std::uint32_t>(bytes.size()), bytes.size());
+    if (touches_window(a, static_cast<std::uint32_t>(bytes.size()))) {
+        valid_range(a, static_cast<std::uint32_t>(bytes.size()));
+        for (std::size_t i = 0; i < bytes.size(); ++i)
+            store(a + static_cast<std::uint32_t>(i), bytes[i], 1);
+        return;
+    }
     check(a, static_cast<std::uint32_t>(bytes.size()), Write);
+    const bool outside = a - quiet_lo_ >= quiet_size_;
+    bool changed = false;
     for (std::size_t i = 0; i < bytes.size();) {
         const auto at = a + static_cast<std::uint32_t>(i);
         auto it = std::prev(regions_.upper_bound(at));
         const auto offset = at - it->first;
         const auto count = std::min(bytes.size() - i, it->second.bytes.size() - offset);
-        std::copy_n(bytes.begin() + i, count, it->second.bytes.begin() + offset);
+        const auto to = it->second.bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+        const auto from = bytes.begin() + static_cast<std::ptrdiff_t>(i);
+        changed = changed || (outside && !std::equal(from, from + count, to));
+        std::copy_n(from, count, to);
         i += count;
     }
+    outside_writes_ += changed;  // see store()
+}
+void ProcessMemory::remember(std::uint32_t a, Hit& into) const {
+    const auto it = regions_.upper_bound(a);
+    if (it == regions_.begin())
+        return;
+    auto& [base, region] = *std::prev(it);
+    const auto bytes = static_cast<std::uint32_t>(region.bytes.size());
+    if (a - base >= bytes || touches_window(base, bytes))
+        return;  // a window over it takes its accesses: those must take the long way
+    into = {base, bytes, const_cast<std::uint8_t*>(region.bytes.data()), region.permissions};
 }
 std::uint64_t ProcessMemory::load(std::uint32_t a, unsigned size, unsigned permission) const {
     if (a & (std::min(size, 4u) - 1u))
         throw std::runtime_error("unaligned SH-4 process read");
+    // Most accesses fall in a region one did lately: no lookup then.
+    Hit& hit = hit_for(a, permission == Execute);
+    if (const auto offset = a - hit.base; offset < hit.size && hit.size - offset >= size &&
+                                          (hit.permissions & permission) == permission) {
+        std::uint64_t value = 0;
+        std::memcpy(&value, hit.bytes + offset, size);  // little-endian, as the guest
+        return value;
+    }
+    ++(permission == Execute ? slow_fetches : slow_reads);
     if (size == 4 && permission == Read)
         if (const auto it = fixed_.find(a); it != fixed_.end())
             return it->second;
     if (a >= 0x80000000u && hardware_ && permission == Read) {
         std::uint64_t value = 0;
-        if (hardware_->read(a, size, value))
+        if (hardware_->read(a, size, value)) {
+            ++device_reads_;
             return value;
+        }
     }
     if (const auto target = window_target(a); target && permission == Read) {
+        ++device_reads_;
         std::uint64_t value = 0;
         if (!hardware_ || !hardware_->read(*target, size, value))
             throw std::runtime_error("VirtualCopy window onto hardware that is not emulated");
         return value;
     }
     check(a, size, permission);
+    remember(a, hit);
     std::uint64_t value = 0;
     for (unsigned i = 0; i < size; ++i) {
         const auto it = std::prev(regions_.upper_bound(a + i));
@@ -278,11 +377,28 @@ std::uint64_t ProcessMemory::load(std::uint32_t a, unsigned size, unsigned permi
     return value;
 }
 void ProcessMemory::store(std::uint32_t a, std::uint64_t v, unsigned size) {
+    if (watching)
+        write_watch().check(a, size, v);
     if (a & (std::min(size, 4u) - 1u))
         throw std::runtime_error("unaligned SH-4 process write");
-    if (a >= 0x80000000u && hardware_ && hardware_->write(a, size, v))
+    // Outside the quiet window, a write counts as work if it changes memory (storing the value
+    // already there, as a status variable each turn of a busy-wait does, changes nothing).
+    const bool outside = a - quiet_lo_ >= quiet_size_;
+    Hit& hit = hit_for(a);
+    if (const auto offset = a - hit.base;
+        offset < hit.size && hit.size - offset >= size && (hit.permissions & Write)) {
+        if (outside && std::memcmp(hit.bytes + offset, &v, size) != 0)  // little-endian
+            ++outside_writes_;
+        std::memcpy(hit.bytes + offset, &v, size);
         return;
+    }
+    ++slow_writes;
+    if (a >= 0x80000000u && hardware_ && hardware_->write(a, size, v)) {
+        outside_writes_ += outside;  // the hardware: work
+        return;
+    }
     if (const auto target = window_target(a)) {
+        outside_writes_ += outside;
         if (!hardware_ || !hardware_->write(*target, size, v))
             throw std::runtime_error("VirtualCopy window onto hardware that is not emulated");
         return;
@@ -290,35 +406,83 @@ void ProcessMemory::store(std::uint32_t a, std::uint64_t v, unsigned size) {
     std::array<std::uint8_t, 8> bytes{};
     for (unsigned i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(v >> (8 * i));
     write_bytes(a, std::span<const std::uint8_t>(bytes.data(), size));
+    remember(a, hit);
+}
+// load()'s first test, without the call: the interpreter's data reads nearly all end here.
+template <typename T>
+bool ProcessMemory::quick_read(std::uint32_t a, T& value) const {
+    constexpr unsigned size = sizeof(T);
+    const Hit& hit = hit_for(a);
+    const auto offset = a - hit.base;
+    if ((a & (std::min(size, 4u) - 1u)) || offset >= hit.size || hit.size - offset < size ||
+        !(hit.permissions & Read))
+        return false;
+    std::memcpy(&value, hit.bytes + offset, size);  // little-endian, as the guest
+    return true;
 }
 std::uint8_t ProcessMemory::read8(std::uint32_t a) {
-    return static_cast<std::uint8_t>(load(a, 1));
+    std::uint8_t v;
+    return quick_read(a, v) ? v : static_cast<std::uint8_t>(load(a, 1));
 }
 std::uint16_t ProcessMemory::read16(std::uint32_t a) {
-    return static_cast<std::uint16_t>(load(a, 2));
+    std::uint16_t v;
+    return quick_read(a, v) ? v : static_cast<std::uint16_t>(load(a, 2));
 }
 std::uint16_t ProcessMemory::fetch16(std::uint32_t a) {
     return static_cast<std::uint16_t>(load(a, 2, Execute));
 }
+bool ProcessMemory::code_span(std::uint32_t a, CodeSpan& span) {
+    // The region fetch16 would read from, when it is executable and no window lies over it.
+    const auto it = regions_.upper_bound(a);
+    if (it == regions_.begin())
+        return false;
+    const auto& [base, region] = *std::prev(it);
+    const auto bytes = static_cast<std::uint32_t>(region.bytes.size());
+    if (a - base >= bytes || !(region.permissions & Execute) || touches_window(base, bytes))
+        return false;
+    span = {region.bytes.data(), base, bytes, &generation_, generation_};
+    return true;
+}
 std::uint32_t ProcessMemory::read32(std::uint32_t a) {
-    return static_cast<std::uint32_t>(load(a, 4));
+    std::uint32_t v;
+    return quick_read(a, v) ? v : static_cast<std::uint32_t>(load(a, 4));
 }
 std::uint64_t ProcessMemory::read64(std::uint32_t a) {
-    return load(a, 8);
+    std::uint64_t v;
+    return quick_read(a, v) ? v : load(a, 8);
+}
+// store()'s first test, without the call (and with the size known): same counting.
+template <typename T>
+bool ProcessMemory::quick_write(std::uint32_t a, T v) {
+    constexpr unsigned size = sizeof(T);
+    Hit& hit = hit_for(a);
+    const auto offset = a - hit.base;
+    if (watching || (a & (std::min(size, 4u) - 1u)) || offset >= hit.size ||
+        hit.size - offset < size || !(hit.permissions & Write))
+        return false;
+    if (a - quiet_lo_ >= quiet_size_ && std::memcmp(hit.bytes + offset, &v, size) != 0)
+        ++outside_writes_;
+    std::memcpy(hit.bytes + offset, &v, size);  // little-endian
+    return true;
 }
 void ProcessMemory::write8(std::uint32_t a, std::uint8_t v) {
-    store(a, v, 1);
+    if (!quick_write(a, v))
+        store(a, v, 1);
 }
 void ProcessMemory::write16(std::uint32_t a, std::uint16_t v) {
-    store(a, v, 2);
+    if (!quick_write(a, v))
+        store(a, v, 2);
 }
 void ProcessMemory::write32(std::uint32_t a, std::uint32_t v) {
-    store(a, v, 4);
+    if (!quick_write(a, v))
+        store(a, v, 4);
 }
 void ProcessMemory::write64(std::uint32_t a, std::uint64_t v) {
-    store(a, v, 8);
+    if (!quick_write(a, v))
+        store(a, v, 8);
 }
 void ProcessMemory::sq_write32(std::uint32_t a, std::uint32_t v) {
+    ++outside_writes_;  // to the hardware
     if (!hardware_ || !hardware_->store_queue_write(a, v))
         throw std::runtime_error("store queues unavailable in HLE process");
 }
@@ -383,6 +547,27 @@ void Kernel::set_class_resolver(ClassResolver resolver) {
     if (system_)
         system_->set_class_resolver(class_resolver_);
 }
+void Kernel::make_system(ProcessMemory& memory) {
+    system_ = std::make_unique<SystemServices>(memory);
+    system_->set_root(file_root_);
+    system_->set_guest_call(guest_call_);
+    system_->set_class_resolver(class_resolver_);
+    system_->set_device_host(device_host_);
+    system_->set_event_signaller([this](std::uint32_t event) {
+        if (synchronization_)
+            synchronization_->set_event(event, true);
+    });
+}
+SystemServices* Kernel::system_services() {
+    if (!system_ && process_)
+        make_system(*process_);
+    return system_.get();
+}
+void Kernel::set_device_host(DeviceHost* host) {
+    device_host_ = host;
+    if (system_)
+        system_->set_device_host(host);
+}
 Kernel::Kernel() = default;
 Kernel::~Kernel() = default;
 const std::vector<std::u16string>& Kernel::debug_messages() const {
@@ -442,13 +627,8 @@ bool Kernel::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target) {
     // Preserve the original v2 event trap addresses while sharing typed handles with mutexes.
     if (target >= kTrapBase + 18 * 4 && target <= kTrapBase + 22 * 4 && !(target & 3u))
         target = *Synchronization::resolve(std::string(kApis[(target - kTrapBase) / 4]));
-    auto* as_process = dynamic_cast<ProcessMemory*>(&memory);
-    if (as_process && !system_) {
-        system_ = std::make_unique<SystemServices>(*as_process);
-        system_->set_root(file_root_);
-        system_->set_guest_call(guest_call_);
-        system_->set_class_resolver(class_resolver_);
-    }
+    if (auto* as_process = dynamic_cast<ProcessMemory*>(&memory); as_process && !system_)
+        make_system(*as_process);
     // CloseHandle serves file and thread handles as well as synchronization objects.
     if (target == *Synchronization::resolve("CloseHandle") &&
         ((system_ && system_->close(c.r[4])) || (scheduler_ && scheduler_->close_handle(c.r[4])))) {

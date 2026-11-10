@@ -39,6 +39,10 @@ struct Options {
     // Optional process-local HLE dispatch. Runs after a call's delay slot with SH-4 arguments
     // in the context; true means it returned normally, false means interpret the guest target.
     std::function<bool(sh4::Ctx&, ::dream::Memory&, std::uint32_t)> hle_call;
+    // Optional: called at each RTS, after its delay slot, with the address it returns to (R0
+    // holds the result). It may let time pass (c.cycles) or switch threads; the RTS then goes on.
+    // dream-wince watches it for busy-waits on the graphics hardware.
+    std::function<void(sh4::Ctx&, std::uint32_t)> on_return;
 };
 
 struct Stats {

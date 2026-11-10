@@ -109,6 +109,7 @@ std::uint32_t ProcessMemory::virtual_alloc(std::uint32_t address, std::uint32_t 
     }
     regions_.merge(pages);
     used_ += added;
+    forget();
     return start;
 }
 void ProcessMemory::virtual_free(std::uint32_t address, std::uint32_t size, std::uint32_t type) {
@@ -129,6 +130,7 @@ void ProcessMemory::virtual_free(std::uint32_t address, std::uint32_t size, std:
                end = size ? rounded_end(address, size) : it->first + r.size;
     if (end > it->first + r.size)
         throw MemoryError(487, "free crosses a reservation");
+    forget();
     for (auto p = begin; p < end; p += kPage) {
         auto& state = r.pages[(p - it->first) / kPage];
         if (state) {
@@ -137,6 +139,10 @@ void ProcessMemory::virtual_free(std::uint32_t address, std::uint32_t size, std:
             state = 0;
         }
     }
+    // A VirtualCopy window goes with the pages it was mapped over (MmUnmapIoSpace releases
+    // them): left behind, it would capture the next reservation at that address.
+    std::erase_if(windows_,
+                  [&](const auto& w) { return w.first < end && begin < w.first + w.second.size; });
     if (type == 0x8000)
         reservations_.erase(it);
 }
@@ -159,6 +165,7 @@ void ProcessMemory::virtual_protect(std::uint32_t address, std::uint32_t size,
     const auto old = it->second.pages[(begin - it->first) / kPage];
     // Write the old protection before changing access, even if the output lives in this range.
     write32(old_pointer, old);
+    forget();
     for (auto p = begin; p < end; p += kPage) {
         it->second.pages[(p - it->first) / kPage] = protect;
         regions_.at(p).permissions = access;

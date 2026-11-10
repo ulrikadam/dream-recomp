@@ -164,6 +164,19 @@ Reply MemoryCard::handle(std::uint8_t command, const std::uint32_t* args, std::s
             // The function selector arrives in the frame's own order, but the block and phase
             // word that follows it is big-endian. Swapping both reads the selector as 2 rather
             // than the storage function and every request is refused.
+            if (args[0] == kLcd) {
+                // The screen's geometry: 48x32 dots (each less one), one colour and no contrast
+                // levels, then padding (Flycast maple_sega_vmu). Windows CE's Maple driver asks
+                // before it lets a title draw on the card, and retries while refused.
+                if (nwords >= 2 && args[1] != 0)
+                    return kUnknownCommand;  // the screen has one partition
+                out.u32(kLcd);
+                out.u8(static_cast<std::uint8_t>(kLcdWidth - 1));
+                out.u8(static_cast<std::uint8_t>(kLcdHeight - 1));
+                out.u8(0x10);
+                out.u8(2);
+                return kDataTransfer;
+            }
             if (args[0] != kStorage)
                 return kUnknownFunction;
             ++media_info_reads;
@@ -402,9 +415,13 @@ void Bus::start_dma() {
                     for (auto& w : resp) w = bswap32(w);
                 bits_out += (resp.size() * 4 + 3) * 8;
                 out_.push_back({recv, std::move(resp)});
+                if (on_frame)
+                    on_frame(port, reci, command, args, static_cast<std::uint8_t>(reply));
             } else {
                 ++no_device;
                 out_.push_back({recv, {0xFFFFFFFFu}});  // no response: the bus times out
+                if (on_frame)
+                    on_frame(port, reci, command, args, 0xFF);
             }
             addr += (2 + words) * 4;
         } else {

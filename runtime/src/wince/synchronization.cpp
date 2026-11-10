@@ -24,9 +24,10 @@ enum Api : unsigned {
     TryCritical,
     EventModify,
     PulseEvent,
-    WaitMultiple
+    WaitMultiple,
+    AddEventAccess
 };
-constexpr std::array<std::string_view, 15> kNames = {"CreateEventW",
+constexpr std::array<std::string_view, 16> kNames = {"CreateEventW",
                                                      "SetEvent",
                                                      "ResetEvent",
                                                      "WaitForSingleObject",
@@ -40,7 +41,8 @@ constexpr std::array<std::string_view, 15> kNames = {"CreateEventW",
                                                      "TryEnterCriticalSection",
                                                      "EventModify",
                                                      "PulseEvent",
-                                                     "WaitForMultipleObjects"};
+                                                     "WaitForMultipleObjects",
+                                                     "AddEventAccess"};
 constexpr std::uint32_t kInfinite = 0xFFFFFFFFu, kTimeout = 258;
 void wait_time(sh4::Ctx& cpu, std::uint32_t milliseconds) {
     if (milliseconds == kInfinite)
@@ -342,12 +344,27 @@ bool Synchronization::invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target
                 }
                 break;
             }
-            case CloseHandle:
-                if (!objects_.erase(a))
+            case AddEventAccess:
+                // (hEvent): a driver takes a reference to a caller's event, which it releases
+                // with CloseHandle once it has set it (WDMLIB completing an overlapped request).
+                // The caller's own handle must survive that.
+                ++object(a, Kind::Event).references;
+                result = 1;
+                break;
+            case CloseHandle: {
+                const auto it = objects_.find(a);
+                if (it == objects_.end())
                     throw MemoryError(6, "invalid CloseHandle synchronization object");
+                if (it->second->references) {
+                    --it->second->references;
+                    result = 1;
+                    break;
+                }
+                objects_.erase(it);
                 std::erase_if(names_, [](const auto& pair) { return pair.second.expired(); });
                 result = 1;
                 break;
+            }
             default:
                 return false;
         }

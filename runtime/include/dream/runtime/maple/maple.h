@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -206,6 +207,11 @@ public:
                   mdapro = 0x00007F00, mmsel = 1;
     // Diagnostics
     std::uint64_t transfers = 0, frames = 0, no_device = 0;
+    // Each frame as the bus answers it (the reply is 0xFF when no device sits there): for
+    // bring-up traces, unset normally.
+    std::function<void(unsigned port, std::uint8_t recipient, std::uint8_t command,
+                       const std::vector<std::uint32_t>& args, std::uint8_t reply)>
+        on_frame;
 
 private:
     void start_dma();

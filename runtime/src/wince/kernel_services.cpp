@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <string_view>
 
 #include "dream/runtime/wince/abi.h"
@@ -9,21 +10,32 @@
 namespace dream::wince {
 namespace {
 constexpr std::uint32_t kBase = 0x1F002000, kStringLimit = 1u << 20;
-#define WINCE_SERVICES(X)                                                                         \
-    X(LocalAlloc)                                                                                 \
-    X(LocalFree)                                                                                  \
-    X(LocalReAlloc) X(LocalSize) X(GetProcessHeap) X(HeapCreate) X(HeapDestroy) X(HeapAlloc)      \
-        X(HeapFree) X(HeapReAlloc) X(HeapSize) X(HeapValidate) X(malloc) X(calloc) X(realloc)     \
-            X(free) X(VirtualAlloc) X(VirtualFree) X(VirtualProtect) X(VirtualQuery) X(memcpy)    \
-                X(memmove) X(memset) X(memcmp) X(strlen) X(strcpy) X(strcat) X(strncpy) X(strcmp) \
-                    X(strncmp) X(strchr) X(strrchr) X(wcslen) X(wcscpy) X(wcscat) X(wcsncpy)      \
-                        X(wcscmp) X(wcsncmp) X(wcschr) X(wcsrchr) X(_wcsicmp) X(_wcsnicmp)        \
-                            X(lstrcmpW) X(lstrcmpiW) X(CharPrevW) X(InterlockedIncrement)         \
-                                X(InterlockedDecrement) X(InterlockedExchange)                    \
-                                    X(InterlockedCompareExchange) X(InterlockedTestExchange)      \
-                                        X(QueryPerformanceCounter) X(QueryPerformanceFrequency)   \
-                                            X(OutputDebugStringW) X(wsprintfW) X(wvsprintfW)      \
-                                                X(_divls) X(_divlu) X(_modls) X(_modlu)
+#define WINCE_SERVICES(X)                                                                          \
+    X(LocalAlloc)                                                                                  \
+    X(LocalFree)                                                                                   \
+    X(LocalReAlloc)                                                                                \
+    X(LocalSize) X(GetProcessHeap) X(HeapCreate) X(HeapDestroy) X(HeapAlloc) X(HeapFree)           \
+        X(HeapReAlloc) X(HeapSize) X(HeapValidate) X(malloc) X(calloc) X(realloc) X(free)          \
+            X(VirtualAlloc) X(VirtualFree) X(VirtualProtect) X(VirtualQuery) X(memcpy) X(memmove)  \
+                X(memset) X(memcmp) X(strlen) X(strcpy) X(strcat) X(strncpy) X(strcmp) X(strncmp)  \
+                    X(strchr) X(strrchr) X(wcslen) X(wcscpy) X(wcscat) X(wcsncpy) X(wcscmp)        \
+                        X(wcsncmp) X(wcschr) X(wcsrchr) X(_wcsicmp) X(_wcsnicmp) X(lstrcmpW)       \
+                            X(lstrcmpiW) X(CharPrevW) X(InterlockedIncrement)                      \
+                                X(InterlockedDecrement) X(InterlockedExchange)                     \
+                                    X(InterlockedCompareExchange) X(InterlockedTestExchange)       \
+                                        X(QueryPerformanceCounter) X(QueryPerformanceFrequency)    \
+                                            X(OutputDebugStringW) X(wsprintfW) X(wvsprintfW)       \
+                                                X(_divls) X(_divlu) X(_modls) X(_modlu) X(_divi64) \
+                                                    X(_divui64) X(_modi64) X(_modui64) X(_addui64) \
+                                                        X(_subui64) X(_muli64) X(_mului64)         \
+                                                            X(_geui64) X(_gti64) X(_gtui64)        \
+                                                                X(_lti64) X(_i64toi) X(_ui64toi)   \
+                                                                    X(_i64toui) X(_ui64toui)       \
+                                                                        X(_uitoui64) X(_uitoi64)   \
+                                                                            X(_itoui64) X(_itoi64) \
+                                                                                X(_itos) X(_utos)  \
+                                                                                    X(_stoi)       \
+                                                                                        X(_stou)
 #define ENUM(name) name,
 enum class Api { WINCE_SERVICES(ENUM) Count };
 #undef ENUM
@@ -330,6 +342,33 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
         return true;
     }
     switch (api) {
+        case Api::_itos:
+        case Api::_utos:
+        case Api::_stoi:
+        case Api::_stou: {
+            // The compiler's float conversions (Sega Rally 2's race code): an integer in R4 to
+            // a float in FR0, or a float in FR4 to an integer in R0, truncated toward zero as C
+            // converts. Out of range, the nearest bound, as the SH-4's FTRC saturates; NaN gives
+            // what FTRC gives for it (0x80000000), and 0 for an unsigned result.
+            if (api == Api::_itos) {
+                c.fr[0] = static_cast<float>(static_cast<std::int32_t>(a));
+            } else if (api == Api::_utos) {
+                c.fr[0] = static_cast<float>(a);
+            } else {
+                const double v = c.fr[4];
+                if (api == Api::_stoi)
+                    result = v != v              ? 0x80000000u
+                             : v >= 2147483648.0 ? 0x7FFFFFFFu
+                             : v <= -2147483649.0
+                                 ? 0x80000000u
+                                 : static_cast<std::uint32_t>(static_cast<std::int32_t>(v));
+                else
+                    result = v != v || v <= -1.0 ? 0u
+                             : v >= 4294967296.0 ? 0xFFFFFFFFu
+                                                 : static_cast<std::uint32_t>(v);
+            }
+            break;
+        }
         case Api::_divls:
         case Api::_divlu:
         case Api::_modls:
@@ -348,6 +387,110 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                 const auto numerator = signed32(a), divisor = signed32(b);
                 result = static_cast<std::uint32_t>(api == Api::_divls ? numerator / divisor
                                                                        : numerator % divisor);
+            }
+            break;
+        }
+        case Api::_divi64:
+        case Api::_divui64:
+        case Api::_modi64:
+        case Api::_modui64:
+        case Api::_addui64:
+        case Api::_subui64:
+        case Api::_muli64:
+        case Api::_mului64:
+        case Api::_geui64:
+        case Api::_gti64:
+        case Api::_gtui64:
+        case Api::_lti64:
+        case Api::_i64toi:
+        case Api::_ui64toi:
+        case Api::_i64toui:
+        case Api::_ui64toui:
+        case Api::_uitoui64:
+        case Api::_uitoi64:
+        case Api::_itoui64:
+        case Api::_itoi64: {
+            // Microsoft SH-4 __int64 helpers: the values live in memory, low word first.
+            // Arithmetic takes (result*, a*, b*), comparisons (a*, b*) and give R0, conversions
+            // to 32 bits (a*) and give R0, conversions from 32 bits (result*, value). Read from
+            // their call sites in MGameStorage (_muli64, _uitoi64) and MGameSound (_divui64,
+            // _geui64, _ui64toui, _uitoui64).
+            const auto load = [&](std::uint32_t p) {
+                return static_cast<std::uint64_t>(memory_.read32(at(p, 0))) |
+                       static_cast<std::uint64_t>(memory_.read32(at(p, 4))) << 32;
+            };
+            const auto store = [&](std::uint32_t p, std::uint64_t v) {
+                memory_.write32(at(p, 0), static_cast<std::uint32_t>(v));
+                memory_.write32(at(p, 4), static_cast<std::uint32_t>(v >> 32));
+            };
+            const auto sign = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
+            switch (api) {
+                case Api::_geui64:
+                    result = load(a) >= load(b);
+                    break;
+                case Api::_gti64:
+                    result = sign(load(a)) > sign(load(b));
+                    break;
+                case Api::_gtui64:
+                    result = load(a) > load(b);
+                    break;
+                case Api::_lti64:
+                    result = sign(load(a)) < sign(load(b));
+                    break;
+                case Api::_i64toi:
+                case Api::_ui64toi:
+                case Api::_i64toui:
+                case Api::_ui64toui:
+                    result = static_cast<std::uint32_t>(load(a));  // the low word, as truncated
+                    break;
+                case Api::_uitoui64:
+                case Api::_uitoi64:
+                    store(a, b);
+                    result = a;
+                    break;
+                case Api::_itoui64:
+                case Api::_itoi64:
+                    store(a, static_cast<std::uint64_t>(
+                                 static_cast<std::int64_t>(static_cast<std::int32_t>(b))));
+                    result = a;
+                    break;
+                default: {
+                    const auto x = load(b), y = load(d);
+                    std::uint64_t r = 0;
+                    if ((api == Api::_divi64 || api == Api::_divui64 || api == Api::_modi64 ||
+                         api == Api::_modui64) &&
+                        !y)
+                        throw std::runtime_error(
+                            "SH-4 division by zero requires WinCE exception dispatch");
+                    const bool overflow =
+                        sign(x) == std::numeric_limits<std::int64_t>::min() && sign(y) == -1;
+                    switch (api) {
+                        case Api::_divi64:
+                            r = overflow ? x : static_cast<std::uint64_t>(sign(x) / sign(y));
+                            break;
+                        case Api::_modi64:
+                            r = overflow ? 0 : static_cast<std::uint64_t>(sign(x) % sign(y));
+                            break;
+                        case Api::_divui64:
+                            r = x / y;
+                            break;
+                        case Api::_modui64:
+                            r = x % y;
+                            break;
+                        case Api::_addui64:
+                            r = x + y;
+                            break;
+                        case Api::_subui64:
+                            r = x - y;
+                            break;
+                        default:  // _muli64, _mului64: the low 64 bits are the same either way
+                            r = x * y;
+                            break;
+                    }
+                    store(a, r);
+                    result = a;
+                    break;
+                }
             }
             break;
         }
@@ -452,6 +595,13 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                 api == Api::strncmp || api == Api::wcsncmp || api == Api::_wcsnicmp;
             const bool insensitive =
                 api == Api::_wcsicmp || api == Api::_wcsnicmp || api == Api::lstrcmpiW;
+            if ((api == Api::lstrcmpW || api == Api::lstrcmpiW) && (!a || !b)) {
+                // The Win32 comparisons (not the CRT's) take a null string as less than any
+                // other, as Windows does: Sega Rally 2 compares a file's name with a name its
+                // own table leaves empty for one of its cars, as it loads a stage.
+                result = !a && !b ? 0u : !a ? 0xFFFFFFFFu : 1u;
+                break;
+            }
             if (api == Api::lstrcmpW || api == Api::lstrcmpiW) {
                 // NLS sorting is not implemented. Avoid silently claiming correct linguistic
                 // comparisons for non-ASCII text through the Windows (rather than CRT) API.

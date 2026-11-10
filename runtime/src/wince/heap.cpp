@@ -1,6 +1,9 @@
 #include "dream/runtime/wince/heap.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <stdexcept>
 
 namespace dream::wince {
 namespace {
@@ -8,6 +11,22 @@ std::uint32_t capacity(std::uint32_t size) {
     if (size > ProcessMemory::kBudget)
         throw MemoryError(8, "heap allocation exceeds budget");
     return (std::max(1u, size) + 7u) & ~7u;
+}
+// DREAM_WINCE_WATCH_FREE=address[:n]: report each heap free of a block holding that address, and
+// stop the run at the nth (a bring-up aid for use-after-free hunts).
+void watch_free(std::uint32_t p, std::uint32_t bytes) {
+    static const char* v = std::getenv("DREAM_WINCE_WATCH_FREE");
+    if (!v)
+        return;
+    static unsigned seen = 0;
+    char* end = nullptr;
+    const auto address = static_cast<std::uint32_t>(std::strtoul(v, &end, 0));
+    const auto stop_at = end && *end == ':' ? std::strtoul(end + 1, nullptr, 0) : 0ul;
+    if (address < p || address - p >= bytes)
+        return;
+    std::fprintf(stderr, "watch-free #%u: block 0x%08x (%u bytes)\n", ++seen, p, bytes);
+    if (seen == stop_at)
+        throw std::runtime_error("watched free");
 }
 }  // namespace
 Heaps::Heaps(ProcessMemory& m) : memory_(m) {
@@ -127,6 +146,7 @@ void Heaps::coalesce(Arena& arena, std::uint32_t p, std::uint32_t size) {
 }
 void Heaps::free(std::uint32_t h, std::uint32_t p, Family family) {
     const auto b = block(h, p, family);
+    watch_free(p, b.capacity);
     auto& owner = heap(h);
     auto& arena = owner.arenas.at(b.arena);
     coalesce(arena, p, b.capacity);

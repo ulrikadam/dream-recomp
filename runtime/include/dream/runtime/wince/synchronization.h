@@ -25,6 +25,7 @@ private:
         Kind kind;
         bool manual = false, signaled = false;
         std::uint32_t owner = 0, recursion = 0;
+        std::uint32_t references = 0;  // AddEventAccess: CloseHandles to absorb before it goes
     };
     struct Critical {
         // Legacy Dreamcast CE ABI: count, owner, opaque kernel token, needtrap.

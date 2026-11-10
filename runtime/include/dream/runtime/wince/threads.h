@@ -22,8 +22,9 @@ struct ThreadExit {
 // thread can block anywhere (inside a window procedure, a DLL initializer...) with its host
 // stack intact; but only the thread holding the baton executes, so guest state needs no locks
 // and a run is deterministic. Scheduling follows CE: the highest-priority ready thread runs,
-// equal priorities take turns at the end of each time slice (`yield`). Time is one virtual clock
-// in CPU cycles; when every thread waits, it jumps to the earliest deadline.
+// equal priorities take turns when the running one's quantum is used up (`preempt`) or it
+// gives up the processor (`yield`). Time is one virtual clock in CPU cycles; when every thread
+// waits, it jumps to the earliest deadline.
 class Scheduler {
 public:
     // Runs a guest thread from its initial context until its thread function returns; the
@@ -48,7 +49,15 @@ public:
     // CreateThread: returns the new thread's handle and sets `id`.
     std::uint32_t create(const sh4::Ctx& initial, bool suspended, std::uint32_t& id);
 
+    // Sleep(0): the next ready thread of the same (or a higher) priority runs, if any.
     void yield();
+    // The end of an interpreter time slice. A higher-priority thread that became ready (an
+    // interrupt woke it) takes over at once; one of the same priority only once the running
+    // thread has used `quantum` cycles since it last got the processor, as CE schedules
+    // (100 ms by default). Slicing finer than CE would interleave a title's threads in orders
+    // the console never produces.
+    void preempt(std::uint64_t quantum);
+    static constexpr std::uint64_t kQuantum = 20'000'000;  // CE's default 100 ms at 200 MHz
     // Blocks the current thread until ready() holds (true) or the clock reaches `deadline`
     // (false). ready() is evaluated with the baton held, each time the thread runs again.
     bool wait(const std::function<bool()>& ready, std::optional<std::uint64_t> deadline);
@@ -67,6 +76,8 @@ public:
     bool exited(std::uint32_t handle) const;  // a thread handle is signalled once it exits
     bool close_handle(std::uint32_t handle);
     bool has_waiters() const;
+    // The earliest time a waiting thread wakes by itself (a Sleep, a wait's timeout), if any.
+    std::optional<std::uint64_t> next_wake() const;
 
     std::uint32_t current_id() const;
     sh4::Ctx& current_ctx() const;
@@ -95,6 +106,7 @@ private:
         int priority = kNormalPriority;
         std::optional<std::uint64_t> deadline;
         bool killed = false;
+        std::uint64_t slice_start = 0;  // the clock when it last got the processor
     };
     Body body_;
     mutable std::mutex mutex_;

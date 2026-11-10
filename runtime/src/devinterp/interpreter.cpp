@@ -1,9 +1,13 @@
 #include "dream/runtime/devinterp/interpreter.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <unordered_map>
 
 #include "dream/runtime/sh4/abi.h"
 #include "dream/runtime/sh4/ops.h"
@@ -12,6 +16,12 @@
 // Every case below is the run-time form of the statement translator/src/emit/emit.cpp emits for the
 // same opcode (lower(), lower_fp_mode(), emit_delayed()). Keep them in step: a divergence here is a
 // divergence between the interpreter and the recompiled game.
+
+#if defined(_MSC_VER)
+#define DREAM_INTERP_NOINLINE __declspec(noinline)
+#else
+#define DREAM_INTERP_NOINLINE __attribute__((noinline))
+#endif
 
 namespace dream::devinterp {
 namespace {
@@ -43,6 +53,44 @@ std::uint64_t trace_budget() {
     return budget;
 }
 
+// sh4::decode of every instruction word, done once: decoding each executed instruction again was
+// a sixth of the interpreter's time. Same decoder, so nothing changes but the cost.
+struct Decoded {
+    std::array<Instr, 0x10000> ins;
+    std::array<bool, 256> delayed;  // sh4::has_delay_slot, by Op
+};
+const Decoded& decoded() {
+    static const Decoded* const table = [] {
+        auto* t = new Decoded;
+        for (std::uint32_t w = 0; w < 0x10000; ++w)
+            t->ins[w] = sh4::decode(static_cast<std::uint16_t>(w));
+        for (unsigned op = 0; op < 256; ++op)
+            t->delayed[op] = sh4::has_delay_slot(static_cast<Op>(op));
+        return t;
+    }();
+    return *table;
+}
+
+// The decoded instructions of a 4 KiB page of guest code, in program order. Looking each one up
+// in the 64 Ki-entry table above missed the processor's cache on nearly every instruction (a
+// fifth of the interpreter's time); kept in order, the next ones are at hand. An entry holds the
+// word it was decoded from and is decoded again when the word differs (other code at the same
+// address, code written at run time), so it never goes stale.
+struct DecodedPage {
+    std::array<Instr, 2048> ins;
+};
+// Per host thread, so that threads never share an entry: dream-wince runs each guest thread on a
+// host thread of its own. The front table answers most page changes without hashing.
+struct PageCache {
+    std::unordered_map<std::uint32_t, std::unique_ptr<DecodedPage>> pages;
+    struct Slot {
+        std::uint32_t base = 1;  // never a page address
+        DecodedPage* page = nullptr;
+    };
+    std::array<Slot, 256> front{};
+};
+thread_local PageCache page_cache;
+
 inline bool native_ok_for(const Options& opt, std::uint32_t t) noexcept {
     return opt.call_translated || (t >= opt.native_lo && t < opt.native_hi);
 }
@@ -53,10 +101,81 @@ struct Machine {
     const Options& opt;
     Stats& st;
     const std::uint32_t return_to;
+    const Decoded& dec = decoded();
+    const std::uint64_t trace = trace_budget();
+    // The code being run, read in place while it stays valid (Memory::code_span); without one,
+    // each instruction goes through fetch16.
+    ::dream::CodeSpan span{};
+    // Spans run before this one: calls go back and forth between a few modules.
+    std::array<::dream::CodeSpan, 4> recent{};
+    unsigned next_recent = 0;
+    bool spans = true;
+
+    bool delayed(Op op) const { return dec.delayed[static_cast<std::uint8_t>(op)]; }
+
+    static bool holds(const ::dream::CodeSpan& s, std::uint32_t pc) {
+        const std::uint32_t offset = pc - s.base;
+        return s.generation && *s.generation == s.at && offset < s.size && s.size - offset >= 2;
+    }
+
+    std::uint16_t word(std::uint32_t pc) {
+        if (!holds(span, pc))
+            return word_elsewhere(pc);
+        std::uint16_t w;
+        std::memcpy(&w, span.bytes + (pc - span.base), 2);  // little-endian, as the guest
+        return w;
+    }
+
+    // Out of line, so that word() stays small enough to be inlined into the loop.
+    DREAM_INTERP_NOINLINE std::uint16_t word_elsewhere(std::uint32_t pc) {
+        if (!spans || (pc & 1))  // an odd PC faults in fetch16, as before
+            return m.fetch16(pc);
+        bool found = false;
+        for (auto& s : recent)
+            if (holds(s, pc)) {
+                std::swap(s, span);
+                found = true;
+                break;
+            }
+        if (!found) {
+            recent[next_recent++ % recent.size()] = span;
+            if (!m.code_span(pc, span) || !holds(span, pc)) {
+                span = {};
+                spans = false;  // none here: fetch16 for the rest of this run
+                return m.fetch16(pc);
+            }
+        }
+        std::uint16_t w;
+        std::memcpy(&w, span.bytes + (pc - span.base), 2);
+        return w;
+    }
+
+    DecodedPage* page = nullptr;
+    std::uint32_t page_base = 1;  // the page `page` decodes; 1 = none yet
+
+    DREAM_INTERP_NOINLINE void enter_page(std::uint32_t base) {
+        auto& slot = page_cache.front[(base >> 12) & 0xFF];
+        if (slot.base != base) {
+            auto& owned = page_cache.pages[base];
+            if (!owned) {
+                owned = std::make_unique<DecodedPage>();
+                owned->ins.fill(dec.ins[0]);  // as decoded from 0x0000, the word it says it holds
+            }
+            slot = {base, owned.get()};
+        }
+        page = slot.page;
+        page_base = base;
+    }
 
     Instr fetch(std::uint32_t pc) {
-        const Instr ins = sh4::decode(m.fetch16(pc));
-        if (st.instructions < trace_budget())
+        const std::uint16_t w = word(pc);
+        if ((pc & ~0xFFFu) != page_base)
+            enter_page(pc & ~0xFFFu);
+        Instr& entry = page->ins[(pc & 0xFFF) >> 1];
+        if (entry.raw != w)
+            entry = dec.ins[w];
+        const Instr ins = entry;
+        if (st.instructions < trace)
             std::fprintf(stderr,
                          "  interp %08x  %04x  %-28s r0=%08x r15=%08x pr=%08x sr=%08x spc=%08x "
                          "ssr=%08x\n",
@@ -875,15 +994,16 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
         }
     };
     unsigned depth = 0;  // interpreted calls not yet returned from, for leave_on_outer_return
+    const std::uint64_t limit = opt.max_instructions ? opt.max_instructions : ~std::uint64_t{0};
     for (;;) {
-        if (opt.max_instructions && st.instructions >= opt.max_instructions)
+        if (st.instructions >= limit)
             return Stop::StepLimit;
         const std::uint32_t pc = c.pc;
         const Instr ins = mc.fetch(pc);
         ++st.instructions;
         c.cycles += 1;
 
-        if (!sh4::has_delay_slot(ins.op)) {
+        if (!mc.delayed(ins.op)) {
             if (ins.op == Op::BT || ins.op == Op::BF) {
                 const std::uint32_t t = sh4::pcrel_target(ins, pc);
                 const bool taken = ins.op == Op::BT ? c.t != 0 : c.t == 0;
@@ -955,7 +1075,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
             default:
                 sh4::unimplemented(c, ins.raw, pc);
         }
-        if (sh4::has_delay_slot(slot.op) || slot.op == Op::BT || slot.op == Op::BF)
+        if (mc.delayed(slot.op) || slot.op == Op::BT || slot.op == Op::BF)
             sh4::unimplemented(c, slot.raw, pc + 2);  // illegal slot instruction, as the emitter
         mc.exec(pc + 2, slot);
 
@@ -1035,6 +1155,10 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 break;
             case Flow::Ret:
                 sh4::trace_return(c, m, pc);
+                if (opt.on_return) {
+                    c.pc = pc;  // the RTS, should the hook look
+                    opt.on_return(c, t);
+                }
                 if (opt.leave_on_outer_return) {
                     if (depth == 0) {
                         if (t == return_to)

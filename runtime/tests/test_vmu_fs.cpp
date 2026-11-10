@@ -155,3 +155,24 @@ TEST_CASE("the card keeps what a title draws on its screen") {
     const auto* bytes = reinterpret_cast<const std::uint8_t*>(args.data() + 2);
     for (std::size_t i = 0; i < MemoryCard::kLcdBytes; ++i) CHECK(card.lcd()[i] == bytes[i]);
 }
+
+TEST_CASE("the card describes its screen when asked") {
+    // Windows CE's Maple driver asks for the screen's media info before a title may draw on it,
+    // and keeps the card busy retrying while it is refused.
+    MemoryCard card;
+    const std::array<std::uint32_t, 2> args{dream::maple::kLcd, 0};
+    dream::maple::Payload out;
+    REQUIRE(card.handle(dream::maple::kGetMediaInfo, args.data(), args.size(), out) ==
+            dream::maple::kDataTransfer);
+    const auto& b = out.bytes();
+    REQUIRE(b.size() == 8);
+    CHECK((b[0] | b[1] << 8 | b[2] << 16 | static_cast<std::uint32_t>(b[3]) << 24) ==
+          dream::maple::kLcd);
+    CHECK(b[4] == 47);  // 48 dots across, less one
+    CHECK(b[5] == 31);  // 32 down, less one
+    // Only the one partition.
+    const std::array<std::uint32_t, 2> other{dream::maple::kLcd, 1};
+    dream::maple::Payload refused;
+    CHECK(card.handle(dream::maple::kGetMediaInfo, other.data(), other.size(), refused) ==
+          dream::maple::kUnknownCommand);
+}

@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "dream/runtime/fenv.h"
+#include "dream/runtime/gdrom/disc.h"
 #include "dream/runtime/wince/dc_hardware.h"
 #include "dream/runtime/wince/directx.h"
 #include "dream/runtime/wince/media.h"
@@ -20,6 +21,15 @@
 #include "dream/runtime/wince/process.h"
 #include "dream/runtime/wince/system_services.h"
 #include "dream/runtime/wince/threads.h"
+#include "dream/runtime/wince/wdm_host.h"
+#ifdef DREAM_WINCE_WINDOW
+#include "live.h"
+#endif
+#ifdef DREAM_WINCE_AUDIO
+#include "dream/audio/sink.h"
+
+#include "cd_audio.h"
+#endif
 #ifdef DREAM_DEV_INTERPRETER
 #include "dream/runtime/devinterp/interpreter.h"
 #endif
@@ -36,6 +46,15 @@ void help() {
            "            [--real-directx]  run the disc's DDRAW/DSOUND, not replacements\n"
            "            [--lazy]  link unsupported COREDLL/DDRAW/DSOUND imports to stubs that\n"
            "                      stop the run, naming the function, only if it is called\n"
+           "            [--window]  show the console live and read the pad (builds with the\n"
+           "                        renderer); runs until the window is closed, with sound\n"
+           "            [--no-audio]  a silent window\n"
+           "            [--no-wait-skip]  run busy-waits on the graphics (DDERR_WASSTILLDRAWING\n"
+           "                              polls) instead of moving on to the next interrupt\n"
+           "            [--vmu card.bin]  the memory card in the pad (saves written back; made\n"
+           "                              blank if missing)\n"
+           "            [--dump-ta F] [--dump-ta-at-frame N] [--dump-ta-last F]  save a render\n"
+           "            [--disc image.gdi]  the disc, for the CD-ROM device (tracks, CD audio)\n"
            "dream-wince --inspect module.exe\n"
            "dream-wince --audit module.exe\n"
            "dream-wince --media-demo output-directory\n"
@@ -210,12 +229,29 @@ int main(int argc, char** argv) {
         if (mode != "--check" && mode != "--run" && mode != "--inspect" && mode != "--audit")
             throw std::invalid_argument("unknown command");
         std::optional<std::uint32_t> base;
-        std::uint32_t steps = 100000;
+        std::uint64_t steps = 100000;
+        bool steps_given = false;
         std::optional<std::filesystem::path> capture_dir;
-        std::string dump_ta;
+        std::string dump_ta, dump_last, vmu, disc_image;
         std::uint64_t dump_ta_at_frame = 0;
-        bool lazy = false, register_servers = false, real_directx = false;
+        bool lazy = false, register_servers = false, real_directx = false, window = false,
+             no_audio = false, no_wait_skip = false;
         for (int i = 3; i < argc; i += 2) {
+            if (std::string_view(argv[i]) == "--window" && mode == "--run") {
+                window = true;
+                --i;
+                continue;
+            }
+            if (std::string_view(argv[i]) == "--no-audio" && mode == "--run") {
+                no_audio = true;
+                --i;
+                continue;
+            }
+            if (std::string_view(argv[i]) == "--no-wait-skip" && mode == "--run") {
+                no_wait_skip = true;
+                --i;
+                continue;
+            }
             if (std::string_view(argv[i]) == "--lazy" && (mode == "--run" || mode == "--check")) {
                 lazy = true;
                 --i;  // a flag, no value
@@ -236,19 +272,34 @@ int main(int argc, char** argv) {
             const std::string_view option = argv[i];
             if (option == "--base")
                 base = number(argv[i + 1]);
-            else if (option == "--steps")
+            else if (option == "--steps") {
                 steps = number(argv[i + 1]);
-            else if (option == "--capture" && mode == "--run")
+                steps_given = true;
+            } else if (option == "--capture" && mode == "--run")
                 capture_dir = argv[i + 1];
             else if (option == "--dump-ta" && mode == "--run")
                 dump_ta = argv[i + 1];
             else if (option == "--dump-ta-at-frame" && mode == "--run")
                 dump_ta_at_frame = number(argv[i + 1]);
+            else if (option == "--dump-ta-last" && mode == "--run")
+                dump_last = argv[i + 1];
+            else if (option == "--vmu" && mode == "--run")
+                vmu = argv[i + 1];
+            else if (option == "--disc" && mode == "--run")
+                disc_image = argv[i + 1];
             else
                 throw std::invalid_argument("unknown option");
         }
         if (!steps)
             throw std::invalid_argument("step limit must be positive");
+        // --window: played rather than measured, so it runs until the window is closed unless a
+        // limit is asked for.
+        if (window && !steps_given)
+            steps = ~std::uint64_t{0};
+#ifndef DREAM_WINCE_WINDOW
+        if (window)
+            throw std::invalid_argument("--window needs a build with the renderer");
+#endif
         const auto file = read_file(argv[2]);
         if (mode == "--inspect") {
             inspect(prepare_pe(file, base));
@@ -262,27 +313,193 @@ int main(int argc, char** argv) {
         DcHardware hardware([&] { return guest_clock(); });
         dream::fenv::apply(dream::fenv::from_fpscr(cpu.fpscr));
         memory.set_hardware(&hardware);
+#ifdef DREAM_WINCE_WINDOW
+        // --window: the console live in a window of its own, and the pad read from the player.
+        std::unique_ptr<LiveWindow> live;
+        if (window) {
+            live = std::make_unique<LiveWindow>(hardware);
+            std::string error;
+            const auto title = "dream-wince: " + std::filesystem::path(argv[2]).filename().string();
+            if (!live->start(title, error))
+                throw std::runtime_error("window: " + error);
+        }
+#endif
+        // Sound follows the window: a run with a picture is played, a run without is measured.
+        // The AICA's output (the title's effects, mixed by its DSOUND on the ARM7) goes out as it
+        // is made, on the guest's clock; the CD audio (--disc, below) streams on the host's.
+        const bool audio = window && !no_audio;
+#ifdef DREAM_WINCE_AUDIO
+        dream::audio::Sink effects;
+        std::unique_ptr<CdAudio> cd_audio;
+        if (audio) {
+            if (effects.open())
+                hardware.aica().on_sample = [&](std::int16_t l, std::int16_t r) {
+                    effects.push(l, r);
+                };
+            else
+                std::fprintf(stderr, "wince: no sound: %s\n", effects.error().c_str());
+        }
+#else
+        if (audio)
+            std::fprintf(stderr, "wince: no sound in this build (SDL3 was not found)\n");
+#endif
+        // DREAM_WINCE_PRESS=start@300,a@420: scripted pad presses, each held 30 frames from that
+        // vertical blank on, on top of the player's (a bring-up aid: does the title answer?).
+        struct Press {
+            std::uint16_t bit;
+            std::uint64_t frame;
+        };
+        std::vector<Press> presses;
+        if (const char* v = std::getenv("DREAM_WINCE_PRESS"))
+            for (std::string_view rest(v); !rest.empty();) {
+                const auto comma = rest.find(',');
+                const auto item = rest.substr(0, comma);
+                rest = comma == rest.npos ? std::string_view() : rest.substr(comma + 1);
+                const auto at = item.find('@');
+                if (at == item.npos)
+                    continue;
+                static const std::pair<std::string_view, std::uint16_t> kButtons[] = {
+                    {"start", dream::maple::kStart}, {"a", dream::maple::kA},
+                    {"b", dream::maple::kB},         {"x", dream::maple::kX},
+                    {"y", dream::maple::kY},         {"up", dream::maple::kUp},
+                    {"down", dream::maple::kDown},   {"left", dream::maple::kLeft},
+                    {"right", dream::maple::kRight}};
+                for (const auto& [name, bit] : kButtons)
+                    if (item.substr(0, at) == name)
+                        presses.push_back({bit, number(item.substr(at + 1))});
+            }
+        // DREAM_WINCE_FRAMES=N: the renders started in each N vertical blanks, to see how many
+        // frames a scene draws per second of guest time.
+        const unsigned frames_every = [] {
+            const char* v = std::getenv("DREAM_WINCE_FRAMES");
+            return v ? static_cast<unsigned>(std::atoi(v)) : 0u;
+        }();
+        std::uint64_t renders_before = 0;
+#ifdef DREAM_WINCE_WINDOW
+        double waited_before = 0;
+#endif
+        auto frames_wall = std::chrono::steady_clock::now();
+        hardware.on_vblank = [&] {
+            if (frames_every) {
+                const auto frame = hardware.system().spg.frames();
+                if (frame && frame % frames_every == 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    // In a window, also the time spent waiting for the wall clock: the room the
+                    // emulation has left at full speed.
+                    double waited = -1;
+#ifdef DREAM_WINCE_WINDOW
+                    if (live) {
+                        waited = live->waited_seconds() - waited_before;
+                        waited_before = live->waited_seconds();
+                    }
+#endif
+                    std::fprintf(
+                        stderr, "frames %llu: %llu renders in %.1f s",
+                        static_cast<unsigned long long>(frame),
+                        static_cast<unsigned long long>(hardware.pvr().renders - renders_before),
+                        std::chrono::duration<double>(now - frames_wall).count());
+                    if (waited >= 0)
+                        std::fprintf(stderr, " (%.1f s waiting)", waited);
+                    std::fputc('\n', stderr);
+                    renders_before = hardware.pvr().renders;
+                    frames_wall = now;
+                }
+            }
+            bool shown = false;
+#ifdef DREAM_WINCE_WINDOW
+            if (live) {
+                live->vblank();
+                shown = true;
+            }
+#endif
+            if (presses.empty())
+                return;
+            auto& state = hardware.pad().state;
+            if (!shown)
+                state.buttons = 0xFFFF;
+            const auto frame = hardware.system().spg.frames();
+            for (const auto& p : presses)
+                if (frame >= p.frame && frame < p.frame + 30)
+                    state.buttons = static_cast<std::uint16_t>(state.buttons & ~p.bit);
+        };
+        // DREAM_WINCE_TRACE_MAPLE=N: the first N Maple frames other than pad reads, with replies.
+        if (const char* n = std::getenv("DREAM_WINCE_TRACE_MAPLE")) {
+            hardware.maple().on_frame =
+                [left = std::atoi(n), &hardware](
+                    unsigned port, std::uint8_t recipient, std::uint8_t command,
+                    const std::vector<std::uint32_t>& args, std::uint8_t reply) mutable {
+                    // Pad reads and the scan of empty ports come every frame: left out.
+                    if (command == dream::maple::kGetCondition || reply == 0xFF || left <= 0)
+                        return;
+                    --left;
+                    std::fprintf(
+                        stderr, "maple: @%llu port %u to 0x%02x command %u",
+                        static_cast<unsigned long long>(hardware.system().sched.now() / 200000),
+                        port, recipient, command);
+                    for (std::size_t i = 0; i < args.size() && i < 3; ++i)
+                        std::fprintf(stderr, " %08x", args[i]);
+                    std::fprintf(stderr, "%s -> reply %u\n", args.size() > 3 ? " ..." : "", reply);
+                };
+        }
+        // --vmu: the memory card in the pad's first slot is that image (an existing card only:
+        // saves are written back to it). Without it the card is blank and lives in memory.
+        if (!vmu.empty()) {
+            const auto status = hardware.load_card(vmu);
+            if (status == dream::maple::CardStatus::Missing) {
+                // A card that does not exist yet is made: blank, formatted, saved there.
+                hardware.card().format();
+                if (!hardware.card().save_as(vmu))
+                    throw std::invalid_argument("--vmu: cannot create a memory card at " + vmu);
+                std::fprintf(stderr, "wince: memory card %s created, formatted and empty\n",
+                             vmu.c_str());
+            } else if (status != dream::maple::CardStatus::Ok) {
+                throw std::invalid_argument("--vmu: not a 128 KB memory card image: " + vmu);
+            }
+        }
         std::uint64_t renders = 0;
         bool dumped = false;
-        hardware.pvr().on_render = [&](const std::vector<std::uint32_t>& stream) {
-            ++renders;
-            const auto frame = hardware.system().spg.frames();
-            if (dump_ta.empty() || dumped || frame < dump_ta_at_frame)
-                return;
-            dumped = true;
-            auto save = [](const std::string& name, const void* data, std::size_t bytes) {
-                if (FILE* f = std::fopen(name.c_str(), "wb")) {
+        // A render as dream_render_view reads it: the display list, then video memory and the
+        // PowerVR registers beside it.
+        const auto save_render = [&](const std::string& name,
+                                     const std::vector<std::uint32_t>& stream) {
+            auto save = [](const std::string& file, const void* data, std::size_t bytes) {
+                if (FILE* f = std::fopen(file.c_str(), "wb")) {
                     std::fwrite(data, 1, bytes, f);
                     std::fclose(f);
                 }
             };
-            save(dump_ta, stream.data(), stream.size() * 4);
-            save(dump_ta + ".vram", hardware.system().memory.vram(),
-                 dream::mem::DcMemory::kVramSize);
-            save(dump_ta + ".vram.regs", hardware.pvr().reg_block(), 0x2000);
+            save(name, stream.data(), stream.size() * 4);
+            save(name + ".vram", hardware.system().memory.vram(), dream::mem::DcMemory::kVramSize);
+            save(name + ".vram.regs", hardware.pvr().reg_block(), 0x2000);
+        };
+        // --dump-ta-last: the last render, written when the run ends however it ends.
+        std::vector<std::uint32_t> last_stream;
+        std::uint64_t last_frame = 0;
+        hardware.pvr().on_render = [&](const std::vector<std::uint32_t>& stream) {
+            ++renders;
+#ifdef DREAM_WINCE_WINDOW
+            if (live)
+                live->render(stream);
+#endif
+            const auto frame = hardware.system().spg.frames();
+            if (!dump_last.empty() && !stream.empty()) {
+                last_stream = stream;
+                last_frame = frame;
+            }
+            if (dump_ta.empty() || dumped || frame < dump_ta_at_frame)
+                return;
+            dumped = true;
+            save_render(dump_ta, stream);
             std::printf("wrote %s: render %llu at frame %llu, %zu parameter words\n",
                         dump_ta.c_str(), static_cast<unsigned long long>(renders),
                         static_cast<unsigned long long>(frame), stream.size());
+        };
+        const auto save_last = [&] {
+            if (dump_last.empty() || last_stream.empty())
+                return;
+            save_render(dump_last, last_stream);
+            std::printf("wrote %s: the last render, at frame %llu\n", dump_last.c_str(),
+                        static_cast<unsigned long long>(last_frame));
         };
         DirectX dx(memory);
         const auto path = std::filesystem::absolute(argv[2]);
@@ -354,10 +571,26 @@ int main(int argc, char** argv) {
         // services in shows up one at a time instead of every static import blocking the link.
         constexpr std::uint32_t kPending = 0x1F200000;
         std::vector<std::string> pending;
+        // DREAM_WINCE_PROFILE: also the host time each service takes and how often it is called,
+        // by the name it was imported under (a blocking wait counts the time other threads ran
+        // meanwhile), and the time the console hardware takes.
+        const char* profile_text = std::getenv("DREAM_WINCE_PROFILE");
+        const bool profile = profile_text != nullptr;
+        struct ServiceTime {
+            std::uint64_t calls = 0;
+            std::chrono::steady_clock::duration time{};
+        };
+        std::map<std::uint32_t, std::string> service_names;
+        std::map<std::uint32_t, ServiceTime> service_time;
+        std::chrono::steady_clock::duration hardware_time{};
+        std::uint64_t services_called = 0;  // for telling a busy-wait from work
         ImportResolver hle = [&](const Import& request) -> std::optional<std::uint32_t> {
             const auto i = named(request);
-            if (auto target = kernel.resolve(i))
+            if (auto target = kernel.resolve(i)) {
+                service_names.emplace(*target,
+                                      i.ordinal ? "#" + std::to_string(*i.ordinal) : i.name);
                 return target;
+            }
             if (!real_directx)  // otherwise DDRAW/DSOUND imports bind to the disc's modules
                 if (auto target = dx.resolve(i))
                     return target;
@@ -445,6 +678,8 @@ int main(int argc, char** argv) {
         cpu.pr = 0x1EFFFFFC;
         cpu.r[15] = stack + 65536 - 16;
         cpu.next_event = ~0ull;
+        // Never deleted: other threads' host threads may still be waiting when main returns.
+        Scheduler* scheduler = nullptr;
         dream::devinterp::Options options;
         options.call_translated = false;
         options.max_instructions = steps;
@@ -456,14 +691,54 @@ int main(int argc, char** argv) {
                 watched.push_back(number(rest.substr(0, comma)));
                 rest = comma == rest.npos ? std::string_view() : rest.substr(comma + 1);
             }
+        // Returns to each call site, for finding busy-waits (below, at options.on_return).
+        struct Turn {  // the last return to a call site
+            std::uint64_t key = ~0ull, cycles = 0, writes = 0, reads = 0, services = 0;
+            std::uint32_t r0 = 0, repeats = 0;
+            std::array<std::uint32_t, 8> preserved{};  // r8..r15
+            std::array<std::uint32_t, 4> call_args{};  // r4..r7 at the last call from the site
+            bool looped = false;  // that call came straight back, with the same arguments
+        };
+        std::array<Turn, 256> turns{};
+        auto turn_key = [](std::uint32_t thread, std::uint32_t site) {
+            return std::uint64_t{thread} << 32 | site;
+        };
+        auto turn_at = [&](std::uint32_t thread, std::uint32_t site) -> Turn& {
+            return turns[((site >> 1) ^ (thread * 0x9E37u)) & (turns.size() - 1)];
+        };
+        // Per thread: the call site the last return went to, while no call has been made since.
+        struct LastReturn {
+            std::uint32_t site = 0;
+            bool clean = false;
+        };
+        std::array<LastReturn, 64> last_return{};
         options.hle_call = [&](auto& c, auto& m, auto target) {
+            // A call from the site the last return went to, with no call in between: a loop
+            // asking the same function again.
+            if (scheduler) {
+                const std::uint32_t thread = scheduler->current_id();
+                auto& last = last_return[thread & (last_return.size() - 1)];
+                if (last.clean && c.pr == last.site)
+                    if (Turn& turn = turn_at(thread, c.pr); turn.key == turn_key(thread, c.pr)) {
+                        const std::array<std::uint32_t, 4> args{c.r[4], c.r[5], c.r[6], c.r[7]};
+                        turn.looped = args == turn.call_args;
+                        turn.call_args = args;
+                    }
+                last.clean = false;
+            }
             if (std::find(watched.begin(), watched.end(), target) != watched.end())
                 std::fprintf(stderr,
-                             "watch: call 0x%08x from 0x%08x (r4=0x%08x r5=0x%08x r6=0x%08x "
-                             "r7=0x%08x r8=0x%08x r9=0x%08x r10=0x%08x r11=0x%08x r12=0x%08x "
-                             "r13=0x%08x r14=0x%08x)\n",
-                             target, c.pr, c.r[4], c.r[5], c.r[6], c.r[7], c.r[8], c.r[9], c.r[10],
-                             c.r[11], c.r[12], c.r[13], c.r[14]);
+                             "watch: thread %u @%llu call 0x%08x from 0x%08x (r4=0x%08x "
+                             "r5=0x%08x r6=0x%08x r7=0x%08x r8=0x%08x r9=0x%08x r10=0x%08x "
+                             "r11=0x%08x r12=0x%08x r13=0x%08x r14=0x%08x)\n",
+                             scheduler ? scheduler->current_id() : 0u,
+                             static_cast<unsigned long long>(c.cycles / 200000), target, c.pr,
+                             c.r[4], c.r[5], c.r[6], c.r[7], c.r[8], c.r[9], c.r[10], c.r[11],
+                             c.r[12], c.r[13], c.r[14]);
+            // Every call and computed jump the guest makes comes here: the services all sit at
+            // 0x1Fxxxxxx, so anything else is guest code, at once.
+            if ((target >> 24) != 0x1F)
+                return false;
             if (target >= kPending && target < kPending + pending.size() * 4 && !(target & 3u)) {
                 char args[160];
                 std::snprintf(args, sizeof args,
@@ -508,8 +783,100 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("unimplemented import called: " +
                                          pending[(target - kPending) / 4] + args + caller + text);
             }
-            return kernel.invoke(c, m, target) || dx.invoke(c, m, target);
+            ++services_called;
+            if (!profile)
+                return kernel.invoke(c, m, target) || dx.invoke(c, m, target);
+            const auto start = std::chrono::steady_clock::now();
+            const bool served = kernel.invoke(c, m, target) || dx.invoke(c, m, target);
+            auto& spent = service_time[target];  // after the call: a wait lets others in
+            ++spent.calls;
+            spent.time += std::chrono::steady_clock::now() - start;
+            return served;
         };
+        // Busy-waits on the graphics hardware. DirectDraw answers DDERR_WASSTILLDRAWING while the
+        // hardware has not caught up (a flip waits for the vertical blank, a lock for a render),
+        // and titles ask again at once, in a loop: Sega Rally 2's `while (FAILED(d3d->Flip()));`
+        // took two thirds of its instructions. Nothing changes the answer before the hardware's
+        // next interrupt, so when one call site gets it twice in quick succession the devices run
+        // on to that interrupt (a frame at most, never past a sleeping thread's wake-up) instead
+        // of the loop: the title gets the same answers, after fewer polls.
+        //
+        // The same goes for a loop that only reads: Sega Rally 2's races wait for the next frame
+        // with `do n = GetFrameCount(); while (n == last);`, the count kept by the vertical-blank
+        // interrupt thread. When a call site gets the same answer three times in quick
+        // succession, each time called again straight after the previous return (a loop, not
+        // a helper several callers share: its vector maths looked the same from inside), the
+        // caller's preserved registers (r8 to r15) unchanged, and nothing was written outside
+        // the thread's stack, no service called and no hardware register read in between,
+        // nothing the loop looks at can change before something else runs: the devices run on
+        // to their next interrupt likewise. --no-wait-skip runs the loops as they are.
+        constexpr std::uint32_t kStillDrawing = 0x8876021C;
+        constexpr std::uint64_t kTightLoop = 20'000, kFrameCycles = 200'000'000 / 60;
+        std::uint64_t wait_skips = 0, poll_skips = 0, cycles_skipped = 0;
+        // DREAM_WINCE_NO_POLL_SKIP: only the DirectDraw rule, to compare.
+        const bool poll_skip = !std::getenv("DREAM_WINCE_NO_POLL_SKIP");
+        std::map<std::uint32_t, std::uint64_t> polled;  // call site -> cycles skipped (profile)
+        auto skip_to_interrupt = [&](dream::sh4::Ctx& ctx) {
+            const auto start = ctx.cycles;
+            auto limit = start + kFrameCycles;
+            if (const auto wake = scheduler->next_wake())
+                limit = std::min(limit, std::max(*wake, start));
+            auto& events = hardware.system().sched;
+            auto now = start;
+            for (;;) {
+                now = std::max(now, std::min(events.next_deadline(), limit));
+                hardware.advance_to(now);
+                const auto& holly = hardware.system().holly;
+                if (kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, true) ||
+                    now >= limit)
+                    break;
+            }
+            ctx.cycles = now;
+            cycles_skipped += now - start;
+            scheduler->preempt(Scheduler::kQuantum);  // the woken interrupt thread runs
+        };
+        if (!no_wait_skip)
+            options.on_return = [&](dream::sh4::Ctx& ctx, std::uint32_t to) {
+                if (!scheduler)
+                    return;
+                const std::uint32_t thread = scheduler->current_id();
+                const auto key = turn_key(thread, to);
+                Turn& turn = turn_at(thread, to);
+                std::array<std::uint32_t, 8> preserved;
+                std::copy_n(&ctx.r[8], 8, preserved.begin());
+                const bool soon = turn.key == key && ctx.cycles - turn.cycles < kTightLoop;
+                const bool same = soon && ctx.r[0] == turn.r0;
+                const bool quiet = same && turn.looped && preserved == turn.preserved &&
+                                   memory.outside_writes() == turn.writes &&
+                                   memory.device_reads() == turn.reads &&
+                                   services_called == turn.services;
+                const std::uint32_t repeats = quiet ? turn.repeats + 1 : 0;
+                if (same && ctx.r[0] == kStillDrawing) {
+                    ++wait_skips;
+                    skip_to_interrupt(ctx);
+                } else if (repeats >= 2 && poll_skip) {
+                    ++poll_skips;
+                    const auto before = ctx.cycles;
+                    skip_to_interrupt(ctx);
+                    if (profile)
+                        polled[to] += ctx.cycles - before;
+                }
+                if (turn.key != key)
+                    turn = Turn{};
+                turn.key = key;
+                turn.cycles = ctx.cycles;
+                turn.writes = memory.outside_writes();
+                turn.reads = memory.device_reads();
+                turn.services = services_called;
+                turn.r0 = ctx.r[0];
+                turn.repeats = repeats;
+                turn.preserved = preserved;
+                turn.looped = false;
+                last_return[thread & (last_return.size() - 1)] = {to, true};
+                // What the functions it calls write below its stack frame is theirs; a write to
+                // the caller's own frame (a loop counter kept there) is work.
+                memory.set_quiet_window(ctx.r[15] - 0x2000, 0x2000);
+            };
         // Every run of guest code goes in time slices, nested ones (DLL entry points, window
         // procedures) too, so another thread can run while this one sits in a callback.
         constexpr std::uint32_t kSlice = 50000;
@@ -517,12 +884,21 @@ int main(int argc, char** argv) {
         sliced.max_instructions = kSlice;
         std::uint64_t executed = 0, thread_instructions = 0;
         std::atomic<std::uint64_t> progress{0};  // what the watchdog watches
-        Scheduler* scheduler = nullptr;
+        // DREAM_WINCE_PROFILE=N: where the time goes, the PC where each run of guest code
+        // stopped (a time slice ends anywhere) weighed by the instructions it ran, in buckets of
+        // N bytes (256 when N is 1 or not a power of two), the busiest printed at the end. 16
+        // finds the loops.
+        std::uint32_t bucket = profile ? std::strtoul(profile_text, nullptr, 0) : 256;
+        if (bucket < 2 || (bucket & (bucket - 1)))
+            bucket = 256;
+        std::map<std::uint32_t, std::uint64_t> samples;
         auto run_sliced = [&](dream::sh4::Ctx& ctx, std::uint32_t return_to,
                               dream::devinterp::Stats& total) {
             for (;;) {
                 dream::devinterp::Stats slice;
                 const auto stop = dream::devinterp::run(ctx, memory, return_to, sliced, &slice);
+                if (profile)  // weighed by what ran: short nested runs end in the same few places
+                    samples[ctx.pc & ~(bucket - 1)] += slice.instructions;
                 executed += slice.instructions;
                 progress.store(executed, std::memory_order_relaxed);
                 total.instructions += slice.instructions;
@@ -531,12 +907,18 @@ int main(int argc, char** argv) {
                     return stop;
                 if (executed >= steps)
                     throw StepBudget{};
+#ifdef DREAM_WINCE_WINDOW
+                if (live && live->closed())  // the player closed the window: the run is over
+                    throw ProcessExit{0};
+#endif
+                const auto hardware_start = std::chrono::steady_clock::now();
                 hardware.advance_to(ctx.cycles);  // vblanks and renders keep time
                 {
                     const auto& holly = hardware.system().holly;
                     kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, true);
                 }
-                scheduler->yield();
+                hardware_time += std::chrono::steady_clock::now() - hardware_start;
+                scheduler->preempt(Scheduler::kQuantum);
             }
         };
         // Never deleted: other threads' host threads may still be waiting when main returns.
@@ -560,9 +942,17 @@ int main(int argc, char** argv) {
                 stop = run_sliced(ctx, Scheduler::kThreadReturn, thread_stats);
             } catch (const std::runtime_error& e) {
                 // Raised again on the main thread: say which thread and where it was.
+                // DREAM_WINCE_REGS: its registers too.
+                std::string regs;
+                if (std::getenv("DREAM_WINCE_REGS"))
+                    for (unsigned i = 0; i < 16; ++i) {
+                        char r[20];
+                        std::snprintf(r, sizeof r, " r%u=%08x", i, ctx.r[i]);
+                        regs += r;
+                    }
                 throw std::runtime_error(std::string(e.what()) + " [thread " +
                                          std::to_string(scheduler->current_id()) + " at " +
-                                         where(ctx.pc) + ", PR " + where(ctx.pr) + "]");
+                                         where(ctx.pc) + ", PR " + where(ctx.pr) + regs + "]");
             }
             thread_instructions += thread_stats.instructions;
             if (stop != dream::devinterp::Stop::Returned)
@@ -584,13 +974,26 @@ int main(int argc, char** argv) {
             return kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, false);
         };
         // Watchdog: a run that stops executing (threads waiting on each other on the host side)
-        // reports every thread's state and ends instead of hanging.
-        std::thread([&progress, scheduler] {
+        // reports every thread's state and ends instead of hanging. DREAM_WINCE_STATUS=N also
+        // reports progress every N seconds (a development aid: the report reads the running
+        // threads' state without stopping them).
+        const char* status_env = std::getenv("DREAM_WINCE_STATUS");
+        const unsigned status_every = status_env ? static_cast<unsigned>(std::atoi(status_env)) : 0;
+        std::thread([&progress, &memory, &hardware, scheduler, status_every] {
             std::uint64_t last = ~0ull;
-            unsigned still = 0;
+            unsigned still = 0, ticks = 0;
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 const auto now = progress.load(std::memory_order_relaxed);
+                if (status_every && ++ticks % status_every == 0)
+                    std::fprintf(stderr,
+                                 "status: %llu instructions, memory %u KiB in %u blocks, maple "
+                                 "transfers %llu frames %llu\n%s",
+                                 static_cast<unsigned long long>(now), memory.used() >> 10,
+                                 memory.allocations(),
+                                 static_cast<unsigned long long>(hardware.maple().transfers),
+                                 static_cast<unsigned long long>(hardware.maple().frames),
+                                 scheduler->describe().c_str());
                 still = now == last ? still + 1 : 0;
                 last = now;
                 if (still >= 15) {
@@ -606,16 +1009,36 @@ int main(int argc, char** argv) {
         // A service calling back into the title (window procedure, timer callback): a nested
         // interpreter run below the caller's frame, returning R0; the caller's state is kept.
         std::uint64_t callback_instructions = 0;
-        const Kernel::GuestCall kernel_guest_call = [&](std::uint32_t function,
-                                                        std::array<std::uint32_t, 4> args) {
+        // Arguments past the fourth go on the stack from SP+16, above the home slots.
+        const auto guest_call = [&](std::uint32_t function,
+                                    const std::vector<std::uint32_t>& args) {
             auto& ctx = scheduler->current_ctx();
             const auto saved = ctx;
-            ctx.r[15] = (ctx.r[15] - 64) & ~3u;
-            memory.check(ctx.r[15] - 16, 16, ProcessMemory::Write);
+            const auto stacked = static_cast<std::uint32_t>(args.size() > 4 ? args.size() - 4 : 0);
+            ctx.r[15] = (ctx.r[15] - 64 - 4 * stacked) & ~3u;
+            memory.check(ctx.r[15] - 16, 16 + 4 * stacked, ProcessMemory::Write);
             ctx.r[15] -= 16;  // the four home slots every CE call reserves
+            for (std::uint32_t i = 0; i < stacked; ++i)
+                memory.write32(ctx.r[15] + 16 + 4 * i, args[4 + i]);
             ctx.pc = function;
             ctx.pr = 0x1EFFFFF0;
-            for (unsigned i = 0; i < 4; ++i) ctx.r[4 + i] = args[i];
+            for (unsigned i = 0; i < 4; ++i) ctx.r[4 + i] = i < args.size() ? args[i] : 0;
+            // A host service (an HLE trap address) is called directly: the interpreter only
+            // recognises one at a call instruction.
+            try {
+                if (options.hle_call(ctx, memory, function)) {
+                    const auto r0 = ctx.r[0];
+                    const auto cycles = ctx.cycles;
+                    ctx = saved;
+                    ctx.cycles = cycles;
+                    return r0;
+                }
+            } catch (...) {
+                const auto cycles = ctx.cycles;
+                ctx = saved;
+                ctx.cycles = cycles;
+                throw;
+            }
             dream::devinterp::Stats nested;
             try {
                 const auto stop = run_sliced(ctx, ctx.pr, nested);
@@ -633,6 +1056,10 @@ int main(int argc, char** argv) {
                 ctx.cycles = cycles;
                 throw;
             }
+        };
+        const Kernel::GuestCall kernel_guest_call = [&](std::uint32_t function,
+                                                        std::array<std::uint32_t, 4> args) {
+            return guest_call(function, {args.begin(), args.end()});
         };
         kernel.set_guest_call(kernel_guest_call);
         // COM classes: ask each DLL beside the executable that exports DllGetClassObject,
@@ -740,8 +1167,84 @@ int main(int argc, char** argv) {
                 const auto hr = kernel_guest_call(function, {0, 0, 0, 0});
                 std::fprintf(stderr, "register: %s -> 0x%08x\n", name.c_str(), hr);
             }
+        // The disc's drivers on the emulated console, hosted as WDEVICE.EXE hosts them: WDMLIB
+        // loads each one registered under HKLM\WDMDrivers\BuiltIn. So far the Maple bus driver
+        // (pads, memory cards); the GD-ROM driver (WSEGACD.DLL) needs a GD-ROM drive first.
+        WdmHost wdm(memory, guest_call,
+                    [&](const std::string& dll, const std::string& name) -> std::uint32_t {
+                        Import symbol;
+                        symbol.dll = dll;
+                        symbol.name = name;
+                        if (dll == "coredll.dll")
+                            return kernel.resolve(symbol).value_or(0);
+                        try {
+                            const auto handle = modules.load_library(dll);
+                            modules.initialize(enter);
+                            return modules.procedure(handle, symbol);
+                        } catch (const std::exception&) {
+                            return 0;
+                        }
+                    });
+        if (real_directx && files.contains("wdmlib.dll") && files.contains("maple.dll")) {
+            auto* system = kernel.system_services();
+            std::vector<std::uint8_t> dll;
+            for (const char16_t c : std::u16string(u"maple.dll")) {
+                dll.push_back(static_cast<std::uint8_t>(c));
+                dll.push_back(static_cast<std::uint8_t>(c >> 8));
+            }
+            dll.insert(dll.end(), {0, 0});
+            const std::u16string key = u"HKEY_LOCAL_MACHINE\\WDMDrivers\\BuiltIn\\Maple";
+            system->set_value(key, u"Dll", 1 /* REG_SZ */, dll);
+            system->set_value(key, u"Order", 4 /* REG_DWORD */, {0, 0, 0, 0});
+            wdm.clock = [&] { return scheduler->current_ctx().cycles; };
+            if (wdm.start()) {
+                kernel.set_device_host(&wdm);
+                std::fprintf(stderr, "wince: driver host started (maple.dll)\n");
+                // On the console WDEVICE starts at boot, seconds before the title, so every pad
+                // and card is found before the title looks (the bus is scanned once a frame and
+                // a card shows up frames after its pad). A title that sees devices arrive while
+                // it starts re-creates its objects with requests still pending. One second of
+                // guest time lets the driver find everything first.
+                scheduler->wait([] { return false; }, cpu.cycles + 200'000'000ull);
+            }
+        }
+        // --disc: the disc image the title came from, for what it asks the CD-ROM device (its
+        // table of contents, CD audio) while no GD-ROM driver runs.
+        if (!disc_image.empty()) {
+            std::string error;
+            const auto disc = dream::gdrom::open_disc(disc_image, error);
+            if (!disc)
+                throw std::invalid_argument("--disc: " + error);
+            std::vector<SystemServices::CdTrack> tracks;
+            for (const auto& t : disc->tracks()) tracks.push_back({t.number, t.lba, t.data});
+            kernel.system_services()->set_cd_tracks(std::move(tracks), disc->leadout_lba());
+            std::fprintf(stderr, "wince: disc %s, %zu tracks\n", disc_image.c_str(),
+                         disc->tracks().size());
+#ifdef DREAM_WINCE_AUDIO
+            // The drive plays CD audio by itself: a second reader of the image, on a thread of
+            // its own.
+            if (audio && effects.is_open()) {
+                if (auto own = dream::gdrom::open_disc(disc_image, error)) {
+                    cd_audio = std::make_unique<CdAudio>(std::move(own));
+                    if (cd_audio->start(error))
+                        kernel.system_services()->set_cd_audio(cd_audio.get());
+                    else {
+                        std::fprintf(stderr, "wince: no CD audio: %s\n", error.c_str());
+                        cd_audio.reset();
+                    }
+                }
+            }
+#endif
+        }
+        // DREAM_WINCE_MODULES: where every module sits, to read addresses in later messages.
+        if (std::getenv("DREAM_WINCE_MODULES"))
+            for (const auto& [name, module] : modules.all())
+                std::fprintf(
+                    stderr, "module %-20s 0x%08x-0x%08x\n", name.c_str(), module.image.base,
+                    module.image.base + static_cast<std::uint32_t>(module.image.bytes.size()));
         dream::devinterp::Stats stats;
         auto result = dream::devinterp::Stop::Returned;
+        const auto run_start = std::chrono::steady_clock::now();
         try {
             result = run_sliced(cpu, cpu.pr, stats);
         } catch (const ProcessExit& exit) {
@@ -749,6 +1252,20 @@ int main(int argc, char** argv) {
         } catch (const StepBudget&) {
             result = dream::devinterp::Stop::StepLimit;
         } catch (const std::runtime_error& e) {
+            save_last();
+            // DREAM_WINCE_PEEK=addr[,addr]: the words at those process addresses when it failed.
+            if (const char* peek = std::getenv("DREAM_WINCE_PEEK"))
+                for (std::string_view rest(peek); !rest.empty();) {
+                    const auto comma = rest.find(',');
+                    const auto address = number(rest.substr(0, comma));
+                    try {
+                        std::fprintf(stderr, "peek 0x%08x = 0x%08x\n", address,
+                                     memory.read32(address));
+                    } catch (const std::exception&) {
+                        std::fprintf(stderr, "peek 0x%08x: unreadable\n", address);
+                    }
+                    rest = comma == rest.npos ? std::string_view() : rest.substr(comma + 1);
+                }
             // DREAM_WINCE_MODULES: where every module sits, to read addresses in the message.
             if (std::getenv("DREAM_WINCE_MODULES"))
                 for (const auto& [name, module] : modules.all())
@@ -758,14 +1275,80 @@ int main(int argc, char** argv) {
             const std::string what = e.what();
             if (what.find("[thread ") != std::string::npos)
                 throw;
+            // DREAM_WINCE_REGS: its registers too, as for the other threads.
+            std::string regs;
+            if (std::getenv("DREAM_WINCE_REGS"))
+                for (unsigned i = 0; i < 16; ++i) {
+                    char r[20];
+                    std::snprintf(r, sizeof r, " r%u=%08x", i, cpu.r[i]);
+                    regs += r;
+                }
             throw std::runtime_error(what + " [main thread at " + where(cpu.pc) + ", PR " +
-                                     where(cpu.pr) + "]");
+                                     where(cpu.pr) + regs + "]");
         }
+        save_last();
         std::cout << "instructions=" << stats.instructions << " HLE calls=" << stats.native_calls
                   << " DLL instructions=" << dll_instructions << " r0=" << cpu.r[0] << "\n";
         std::cout << "video: frames=" << hardware.system().spg.frames() << " renders=" << renders
                   << " device accesses=" << hardware.accesses() << "\n";
+        if (wait_skips || poll_skips)
+            std::cout << "busy-waits skipped=" << wait_skips << " polls skipped=" << poll_skips
+                      << " guest time skipped="
+                      << cycles_skipped * 100 / std::max<std::uint64_t>(cpu.cycles, 1) << "%\n";
+#ifdef DREAM_WINCE_WINDOW
+        if (live)
+            std::cout << "window: drawn=" << live->renders() << " shown=" << live->presented()
+                      << "\n";
+#endif
         std::cout << "main thread at " << where(cpu.pc) << ", PR " << where(cpu.pr) << "\n";
+        if (std::getenv("DREAM_WINCE_MODULES"))
+            for (const auto& [name, module] : modules.all()) {
+                char range[40];
+                std::snprintf(
+                    range, sizeof range, "0x%08x-0x%08x", module.image.base,
+                    module.image.base + static_cast<std::uint32_t>(module.image.bytes.size()));
+                std::cout << "module " << name << " " << range << "\n";
+            }
+        if (profile) {
+            std::vector<std::pair<std::uint64_t, std::uint32_t>> busiest;
+            for (const auto& [pc, n] : samples) busiest.emplace_back(n, pc);
+            std::sort(busiest.rbegin(), busiest.rend());
+            std::uint64_t all = 0;
+            for (const auto& [n, pc] : busiest) all += n;
+            for (std::size_t i = 0; i < busiest.size() && i < 25; ++i)
+                std::cout << "profile: " << where(busiest[i].second) << " "
+                          << busiest[i].first * 100 / std::max<std::uint64_t>(all, 1) << "%\n";
+            const auto seconds = [](std::chrono::steady_clock::duration d) {
+                return std::chrono::duration<double>(d).count();
+            };
+            std::chrono::steady_clock::duration services{};
+            std::vector<std::pair<std::chrono::steady_clock::duration, std::uint32_t>> costliest;
+            for (const auto& [target, spent] : service_time) {
+                services += spent.time;
+                costliest.emplace_back(spent.time, target);
+            }
+            std::sort(costliest.rbegin(), costliest.rend());
+            std::printf("profile: host %.1f s, of which services %.1f s, hardware %.1f s\n",
+                        seconds(std::chrono::steady_clock::now() - run_start), seconds(services),
+                        seconds(hardware_time));
+            for (const auto& [site, skipped] : polled)
+                std::printf("profile: polls returning to %s: %.3f s of guest time skipped\n",
+                            where(site).c_str(), static_cast<double>(skipped) / 200e6);
+            std::printf("profile: slow memory accesses: reads=%llu writes=%llu fetches=%llu\n",
+                        static_cast<unsigned long long>(memory.slow_reads),
+                        static_cast<unsigned long long>(memory.slow_writes),
+                        static_cast<unsigned long long>(memory.slow_fetches));
+            for (std::size_t i = 0; i < costliest.size() && i < 15; ++i) {
+                const auto target = costliest[i].second;
+                const auto name = service_names.find(target);
+                std::printf(
+                    "profile: service %-28s calls=%-9llu %.2f s\n",
+                    name != service_names.end() ? name->second.c_str() : where(target).c_str(),
+                    static_cast<unsigned long long>(service_time[target].calls),
+                    seconds(costliest[i].first));
+            }
+            std::fflush(stdout);
+        }
         std::cout << "sound: ARM7 " << (hardware.aica().arm.enabled() ? "running" : "held")
                   << " instructions=" << hardware.aica().arm.instructions
                   << " samples=" << hardware.aica().samples << " sound RAM in use="
@@ -773,11 +1356,25 @@ int main(int argc, char** argv) {
                                    hardware.system().memory.aram() + (2u << 20),
                                    [](std::uint8_t b) { return b != 0; })
                   << " bytes\n";
+#ifdef DREAM_WINCE_AUDIO
+        if (effects.is_open())
+            std::cout << "heard: effects samples=" << effects.pushed << " blocks=" << effects.blocks
+                      << " gaps=" << effects.starved << " dropped=" << effects.dropped
+                      << " CD sectors=" << (cd_audio ? cd_audio->sectors_played() : 0) << "\n";
+#endif
         std::cout << "G2 DMA: transfers=" << hardware.g2().transfers
                   << " bytes=" << hardware.g2().bytes << " refused=" << hardware.g2().refused
                   << " to sound RAM=" << hardware.g2().to_aica_ram << "\n";
         std::cout << "store queues: bursts mapped=" << hardware.system().memory.sq_tlb_flushes
                   << " unmapped=" << hardware.system().memory.sq_tlb_misses << "\n";
+        std::cout << "maple: transfers=" << hardware.maple().transfers
+                  << " frames=" << hardware.maple().frames
+                  << " pad reads=" << hardware.pad().condition_reads
+                  << " card reads=" << hardware.card().block_reads
+                  << " writes=" << hardware.card().block_writes << "\n";
+        if (wdm.opens || wdm.controls)
+            std::cout << "drivers: opens=" << wdm.opens << " requests=" << wdm.controls
+                      << " transfers=" << wdm.transfers << " failed=" << wdm.failures << "\n";
         std::cout << "interrupts:";
         for (const auto& [id, count] : kernel.interrupt_counts())
             std::cout << " SYSINTR " << id << "=" << count;

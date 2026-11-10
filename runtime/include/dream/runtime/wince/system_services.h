@@ -14,6 +14,37 @@
 #include "dream/runtime/wince/process.h"
 
 namespace dream::wince {
+// Devices served by drivers running in the process, as WDEVICE.EXE serves them on the console:
+// CreateFileW on "\Device\NAME" opens one through the host, and the file calls on that handle go
+// to the object it returned. Each call gives the Win32 result and sets `error` on failure.
+class DeviceHost {
+public:
+    virtual ~DeviceHost() = default;
+    // The driver's file object for `handle` (the handle the caller will get), or 0.
+    virtual std::uint32_t open(const std::u16string& name, std::uint32_t access,
+                               std::uint32_t flags, std::uint32_t handle, std::uint32_t& error) = 0;
+    virtual bool control(std::uint32_t object, std::uint32_t code, std::uint32_t in,
+                         std::uint32_t in_size, std::uint32_t out, std::uint32_t out_size,
+                         std::uint32_t returned, std::uint32_t overlapped,
+                         std::uint32_t& error) = 0;
+    virtual bool read_write(std::uint32_t object, bool write, std::uint32_t buffer,
+                            std::uint32_t size, std::uint32_t done, std::uint32_t overlapped,
+                            std::uint32_t& error) = 0;
+    virtual void close(std::uint32_t object) = 0;
+};
+
+// Where the disc's CD audio is heard: a title's play, stop, pause, resume and volume requests on
+// "\Device\CDROM0" go here. Addresses are FADs (LBA + 150), the end excluded.
+class CdAudioOutput {
+public:
+    virtual ~CdAudioOutput() = default;
+    virtual void play(std::uint32_t start_fad, std::uint32_t end_fad) = 0;
+    virtual void stop() = 0;
+    virtual void pause() = 0;
+    virtual void resume() = 0;
+    virtual void volume(std::uint8_t left, std::uint8_t right) = 0;
+};
+
 // COREDLL services a title needs to start that are not memory, CRT or synchronization: the
 // registry first. Single-threaded, like the other HLE services. Registry functions return their
 // Win32 error code directly (they do not set the last error), as on CE.
@@ -29,8 +60,9 @@ public:
     static std::uint32_t bios_stub(unsigned index);
     bool invoke(sh4::Ctx& cpu, Memory& memory, std::uint32_t target, std::uint32_t& last_error);
 
-    // In-memory registry. Paths are "HKLM\\Software\\..." with any case; a value's data is raw
-    // bytes in guest layout (REG_SZ is UTF-16 with its terminator).
+    // In-memory registry. Paths start with the root's full name ("HKEY_LOCAL_MACHINE\\Software\\
+    // ...") in any case; a value's data is raw bytes in guest layout (REG_SZ is UTF-16 with its
+    // terminator).
     void set_value(const std::u16string& key, const std::u16string& name, std::uint32_t type,
                    std::vector<std::uint8_t> data);
     bool has_key(const std::u16string& key) const;
@@ -39,7 +71,28 @@ public:
     // leading "\" both name its top; nothing outside it can be reached.
     void set_root(std::filesystem::path root) { root_ = std::move(root); }
     // CloseHandle for a file or device handle; false when the handle is not one of these.
-    bool close(std::uint32_t handle) { return files_.erase(handle) != 0; }
+    bool close(std::uint32_t handle);
+    // Without a host, devices open but refuse every request.
+    void set_device_host(DeviceHost* host) { device_host_ = host; }
+
+    // The disc's tracks, for "\Device\CDROM0" while no driver serves it: the NT CD-ROM requests
+    // a title's CD audio makes (the table of contents of the high-density area, play, stop,
+    // pause, volume) are answered from them; what plays goes to the CdAudioOutput below.
+    struct CdTrack {
+        unsigned number = 0;
+        std::uint32_t lba = 0;
+        bool data = false;
+    };
+    void set_cd_tracks(std::vector<CdTrack> tracks, std::uint32_t leadout_lba) {
+        cd_tracks_ = std::move(tracks);
+        cd_leadout_ = leadout_lba;
+    }
+    // Without one, CD audio requests are accepted and nothing is heard.
+    void set_cd_audio(CdAudioOutput* out) { cd_audio_ = out; }
+    // Signals a synchronization event (a request answered at once still sets the OVERLAPPED's).
+    void set_event_signaller(std::function<void(std::uint32_t)> signal) {
+        signal_event_ = std::move(signal);
+    }
 
     // Runs a guest function (a window procedure, a timer callback) with up to four arguments
     // and returns its R0. Windows need it: the system calls into the title.
@@ -134,7 +187,19 @@ private:
         bool device = false;
         std::unique_ptr<std::ifstream> stream;
         std::uint64_t size = 0, position = 0;
+        std::uint32_t object = 0;  // a device's file object in its driver (DeviceHost)
     };
+    DeviceHost* device_host_ = nullptr;
+    std::vector<CdTrack> cd_tracks_;
+    std::uint32_t cd_leadout_ = 0;
+    CdAudioOutput* cd_audio_ = nullptr;
+    std::array<std::uint8_t, 4> cd_volume_{0xFF, 0xFF, 0xFF, 0xFF};
+    std::function<void(std::uint32_t)> signal_event_;
+    std::vector<std::uint32_t> cd_plays_reported_;
+    // A CD-ROM request on "\Device\CDROM0"; nullopt when it is not one answered here.
+    std::optional<bool> cd_request(std::uint32_t code, std::uint32_t in, std::uint32_t in_size,
+                                   std::uint32_t out, std::uint32_t out_size,
+                                   std::uint32_t& returned);
     std::filesystem::path root_;
     std::map<std::uint32_t, File> files_;
     std::uint32_t next_file_ = 0x1D500000;

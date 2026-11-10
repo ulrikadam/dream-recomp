@@ -3,10 +3,16 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <stdexcept>
 
 namespace dream::wince {
+namespace {
+// armcom.drv's header in sound RAM: the address of its work area, written once it is ready, and
+// its write pointer in the ring of events it raises for the SH-4.
+constexpr std::uint32_t kWorkArea = 0xEC, kRingPointer = 0xE4, kAramMask = (2u << 20) - 4u;
+}  // namespace
 DcHardware::DcHardware(std::function<std::uint64_t()> clock) : clock_(std::move(clock)) {
     // Built as boot_main builds it for a Katana title, minus the CPU side: the System is never
     // installed as the ABI hook target (nothing here is translated code).
@@ -48,6 +54,21 @@ DcHardware::DcHardware(std::function<std::uint64_t()> clock) : clock_(std::move(
         system_->sched.request(rtc_tick_, 200'000'000ull);
     });
     sys.sched.request(rtc_tick_, 200'000'000ull);
+    maple_ = std::make_unique<maple::Bus>(sys.sched, sys.holly, sys.memory);
+    auto pad = std::make_unique<maple::Controller>();
+    pad_ = pad.get();
+    auto card = std::make_unique<maple::MemoryCard>();
+    card->format();
+    card_ = card.get();
+    maple_->attach_expansion(0, 0, std::move(card));
+    maple_->attach(0, std::move(pad));
+    sys.memory.map_mmio(maple::Bus::kBase, maple::Bus::kEnd, maple_.get());
+    // The pad is read for the frame before the bus's hardware-triggered transfer.
+    sys.spg.on_vblank_out = [this] {
+        if (on_vblank)
+            on_vblank();
+        maple_->vblank();
+    };
     sys.memory.on_device_access = [this] {
         if (clock_)
             advance_to(clock_());
@@ -64,7 +85,30 @@ void DcHardware::boot_sound(const std::vector<std::uint8_t>& file) {
     m.write32(arm_reset, (m.read32(arm_reset) & ~0xFFu) | 1u);  // hold the ARM
     const auto bytes = std::min<std::size_t>(file.size() - 12, 2u << 20);
     std::copy_n(file.begin() + 12, bytes, m.aram());
+    // The event ring's start: where 0xE4 (the driver's write pointer in it) points at boot.
+    std::uint32_t ring = 0;
+    if (bytes >= kRingPointer + 4)
+        std::memcpy(&ring, m.aram() + kRingPointer, 4);
+    sound_ring_ = ring & kAramMask;
     m.write32(arm_reset, m.read32(arm_reset) & ~0xFFu);  // and let it run
+}
+
+void DcHardware::hand_over_sound_ring() {
+    std::uint8_t* aram = system_->memory.aram();
+    std::uint32_t area = 0;
+    std::memcpy(&area, aram + kWorkArea, 4);
+    if (!area)
+        return;  // not ready yet
+    // As SNDCORE.DLL opened first computes it: the work area + 8, the word aligned on 8.
+    const std::uint32_t at = ((area + 8u) & ~4u) & kAramMask;
+    std::memcpy(aram + at, &sound_ring_, 4);
+    std::fprintf(stderr, "wince: sound driver ready: event ring at 0x%x, noted at 0x%x\n",
+                 sound_ring_, at);
+    sound_ring_ = 0;
+}
+
+maple::CardStatus DcHardware::load_card(const std::string& path) {
+    return card_->load(path);
 }
 
 void DcHardware::advance_to(std::uint64_t cycles) {
@@ -74,6 +118,8 @@ void DcHardware::advance_to(std::uint64_t cycles) {
     advancing_ = true;  // an event may touch a device, which would come back here
     sched.advance_to(cycles);
     advancing_ = false;
+    if (sound_ring_)
+        hand_over_sound_ring();
 }
 
 namespace {

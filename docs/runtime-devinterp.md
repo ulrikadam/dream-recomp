@@ -109,12 +109,40 @@ non-local return thrown by natively called code continue interpreting at its tar
 leaves it off so `run_guest` handles it), and `Hooks::on_resume` (resume at an address inside
 untranslated code: interpret from there with no return address to stop at).
 
+## Speed (2026-11-10)
+
+The interpreter is all of dream-wince's execution (Windows CE titles are not translated), so its
+cost per instruction is the title's speed. Measured on Sega Rally 2's race with a sampling
+profiler, fetching and decoding were half of it; three changes took the race from 9.3 to about
+4 seconds per 300 frames (26 to about 60 million instructions a second), with the same renders in
+the same frames:
+
+- **every word decoded once.** `sh4::decode` of all 65,536 words, and `has_delay_slot` of every
+  op, are tables built at first use: the same decoder, so nothing changes but the cost.
+- **code read in place.** `Memory::code_span` hands the interpreter the executable region holding
+  PC (host pointer, base, size) with a generation counter the memory bumps whenever such a region
+  may move or go away (`ProcessMemory::forget`). While PC stays in it and the counter has not moved,
+  an instruction is two bytes read from the region, not a virtual `fetch16` and its region lookup;
+  the last four regions are kept, as calls go back and forth between modules. Reads see stores to
+  the same bytes, so code written at run time still runs as written. A memory without spans (the
+  default, as `DcMemory`) is fetched through `fetch16` as before.
+- **decoded instructions kept in program order.** Looking each word up in the 1 MB table missed
+  the processor's cache on nearly every instruction (a fifth of the time). Each 4 KiB page of code
+  run gets an array of its decoded instructions, in order, per host thread (dream-wince runs each
+  guest thread on a host thread of its own, so threads never share one). An entry holds the word it
+  was decoded from and is decoded again whenever the word read differs: other code at the same
+  address or code rewritten after it ran can never run stale (`test_devinterp`, `test_wince_pe`).
+
+What is left is the dispatch itself (branches the host cannot predict). Going further means
+running blocks of translated code rather than one instruction at a time.
+
 ## Tests
 
 - `runtime/tests/test_devinterp.cpp`: an untranslated callee (hand-assembled in RAM, with a
   delay-slot instruction) returning to a translated caller; interpreted code calling a translated
   function natively and resuming; an untranslated interrupt handler running in register bank 1 and
-  unwinding through `rte`; the step limit. In the release configuration the same file checks that
+  unwinding through `rte`; the step limit; an instruction rewritten after it ran, which must run as
+  rewritten. In the release configuration the same file checks that
   the miss is recorded and throws.
 - `tests/sh4/test_golden.cpp`: every golden (p1–p7, the GCC C unit, the Crazy Taxi slice) replays in
   three modes, translated, interpreted, and hybrid (calls into translated code made natively), and

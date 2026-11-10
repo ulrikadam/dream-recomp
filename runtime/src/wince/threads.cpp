@@ -82,6 +82,7 @@ void Scheduler::host(Thread* thread) {
     }
     next->state = State::Running;
     next->cpu->cycles = now_;
+    next->slice_start = now_;
     running_ = next->id;
     turn_.notify_all();
 }
@@ -155,10 +156,12 @@ void Scheduler::switch_to(std::unique_lock<std::mutex>& lock, Thread* next) {
     if (next == self_) {
         self_->state = State::Running;
         self_->cpu->cycles = now_;
+        self_->slice_start = now_;
         return;
     }
     next->state = State::Running;
     next->cpu->cycles = now_;
+    next->slice_start = now_;
     running_ = next->id;
     turn_.notify_all();
     await_turn(lock);
@@ -167,6 +170,31 @@ void Scheduler::switch_to(std::unique_lock<std::mutex>& lock, Thread* next) {
 void Scheduler::yield() {
     std::unique_lock lock(mutex_);
     if (!self_)
+        return;
+    self_->state = State::Ready;
+    Thread* next = pick(lock);
+    if (!next)
+        throw std::runtime_error("deadlock: the running guest thread is suspended");
+    switch_to(lock, next);
+}
+
+void Scheduler::preempt(std::uint64_t quantum) {
+    std::unique_lock lock(mutex_);
+    if (!self_)
+        return;
+    now_ = std::max(now_, self_->cpu->cycles);
+    bool higher = false, equal = false;
+    for (auto& [id, t] : threads_) {
+        if (t.get() == self_ || (t->suspended && !t->killed))
+            continue;
+        const bool ready = t->state == State::Ready ||
+                           (t->state == State::Waiting && t->deadline && *t->deadline <= now_);
+        if (!ready)
+            continue;
+        higher |= t->priority < self_->priority;
+        equal |= t->priority == self_->priority;
+    }
+    if (!higher && !(equal && now_ - self_->slice_start >= quantum))
         return;
     self_->state = State::Ready;
     Thread* next = pick(lock);
@@ -194,6 +222,15 @@ bool Scheduler::wait(const std::function<bool()>& ready, std::optional<std::uint
         switch_to(lock, next);
         self_->deadline.reset();
     }
+}
+
+std::optional<std::uint64_t> Scheduler::next_wake() const {
+    std::unique_lock lock(mutex_);
+    std::optional<std::uint64_t> earliest;
+    for (const auto& [id, t] : threads_)
+        if (t->state == State::Waiting && t->deadline && !t->suspended)
+            earliest = earliest ? std::min(*earliest, *t->deadline) : *t->deadline;
+    return earliest;
 }
 
 void Scheduler::notify() {

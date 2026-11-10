@@ -2,6 +2,8 @@
 // fault instead. Guest code is hand-assembled into RAM; addresses are chosen so nothing here
 // collides with the translated stand-ins other tests register.
 #include <initializer_list>
+#include <utility>
+#include <vector>
 
 #include "dream/runtime/sh4/ops.h"
 #include "dream/runtime/system.h"
@@ -128,6 +130,33 @@ TEST_CASE("devinterp: the step limit stops a runaway loop") {
     sh4::set_hooks(nullptr);
 }
 
+TEST_CASE("devinterp: on_return sees every RTS with its return address and result") {
+    // sts.l pr,@-r15 ; bsr callee ; nop ; lds.l @r15+,pr ; rts ; nop ; (pad) ;
+    // callee: mov #42,r0 ; rts ; add #1,r0 (the slot runs before the hook looks)
+    System sys;
+    sys.install();
+    auto& c = sys.ctx;
+    put(sys.memory, 0x8C020000u,
+        {0x4F22u, 0xB005u, 0x0009u, 0x4F26u, 0x000Bu, 0x0009u, 0x0009u, 0x0009u, 0xE02Au, 0x000Bu,
+         0x7001u});
+    c.r[15] = 0x8C00F400u;
+    c.pr = 0x8C00FFF0u;
+    c.pc = 0x8C020000u;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> seen;  // return address, R0
+    devinterp::Options opt;
+    opt.on_return = [&](sh4::Ctx& ctx, std::uint32_t to) {
+        seen.emplace_back(to, ctx.r[0]);
+        ctx.cycles += 1000;  // the hook may let time pass
+    };
+    const auto before = c.cycles;
+    CHECK(devinterp::run(c, sys.memory, 0x8C00FFF0u, opt, nullptr) == devinterp::Stop::Returned);
+    CHECK(seen == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{0x8C020006u, 43u},
+                                                                       {0x8C00FFF0u, 43u}});
+    CHECK(c.cycles >= before + 2000);
+    CHECK(c.r[15] == 0x8C00F400u);
+    sh4::set_hooks(nullptr);
+}
+
 TEST_CASE("devinterp: a pre-decrement store of its own pointer writes the value from before") {
     // mov.l r15,@-r15 ; mov.w r1,@-r1 ; mov.b r2,@-r2 ; rts ; nop. GCC pushes a struct-return
     // pointer with the first one (Virtua Tennis); storing the decremented r15 put every returned
@@ -149,6 +178,32 @@ TEST_CASE("devinterp: a pre-decrement store of its own pointer writes the value 
     CHECK(sys.memory.read16(0x8C100020u) == 0x0022u);
     CHECK(c.r[2] == 0x8C100030u);
     CHECK(sys.memory.read8(0x8C100030u) == 0x31u);
+    sh4::set_hooks(nullptr);
+}
+
+TEST_CASE("devinterp: an instruction rewritten after it ran runs as rewritten") {
+    // The interpreter keeps decoded instructions; one whose word changes must be decoded again.
+    //   mov #0,r0 ; X: add #1,r0 ; cmp/eq #1,r0 ; bf end ; mov.w r5,@r4 (X := add #16,r0) ;
+    //   bra X ; nop ; end: rts ; nop
+    // Stale, X would add 1 again and return 2.
+    System sys;
+    sys.install();
+    auto& c = sys.ctx;
+    put(sys.memory, 0x8C020000u,
+        {0xE000u, 0x7001u, 0x8801u, 0x8B02u, 0x2451u, 0xAFFAu, 0x0009u, 0x000Bu, 0x0009u});
+    c.r[4] = 0x8C020002u;
+    c.r[5] = 0x7010u;
+    c.pr = 0x8C00FFF0u;
+    c.pc = 0x8C020000u;
+    devinterp::Options opt;
+    CHECK(devinterp::run(c, sys.memory, 0x8C00FFF0u, opt, nullptr) == devinterp::Stop::Returned);
+    CHECK(c.r[0] == 17u);
+    // Run again with the word put back: decoded again, from what is there now.
+    sys.memory.write16(0x8C020002u, 0x7001u);
+    c.pr = 0x8C00FFF0u;
+    c.pc = 0x8C020000u;
+    CHECK(devinterp::run(c, sys.memory, 0x8C00FFF0u, opt, nullptr) == devinterp::Stop::Returned);
+    CHECK(c.r[0] == 17u);
     sh4::set_hooks(nullptr);
 }
 

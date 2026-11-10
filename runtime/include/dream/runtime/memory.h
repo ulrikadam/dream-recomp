@@ -13,9 +13,22 @@
 
 namespace dream {
 
+// Guest code an interpreter may read straight from host memory: [base, base + size) is at
+// `bytes` while *generation still equals `at` (the memory bumps it whenever such a span may move
+// or go away). Reads through it see stores to the same bytes, so self-modifying code still works.
+struct CodeSpan {
+    const std::uint8_t* bytes = nullptr;
+    std::uint32_t base = 0, size = 0;
+    const std::uint64_t* generation = nullptr;
+    std::uint64_t at = 0;
+};
+
 class Memory {
 public:
     virtual ~Memory() = default;
+    // The executable span holding `addr`, for fetching without a call per instruction. False
+    // (the default) when there is none: fetch16 then serves each instruction.
+    virtual bool code_span(std::uint32_t /*addr*/, CodeSpan& /*span*/) { return false; }
     virtual std::uint8_t read8(std::uint32_t addr) = 0;
     virtual std::uint16_t read16(std::uint32_t addr) = 0;
     // Instruction access may have different permissions from a data read.

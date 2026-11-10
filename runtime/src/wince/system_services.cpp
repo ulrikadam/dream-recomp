@@ -10,29 +10,33 @@
 namespace dream::wince {
 namespace {
 constexpr std::uint32_t kBase = 0x1F006000;
-#define WINCE_SYSTEM(X)                                                                            \
-    X(RegOpenKeyExW)                                                                               \
-    X(RegCreateKeyExW)                                                                             \
-    X(RegCloseKey)                                                                                 \
-    X(RegQueryValueExW) X(RegSetValueExW) X(RegEnumKeyExW) X(RegQueryInfoKeyW) X(KernelIoControl)  \
-        X(QueryAPISetID) X(CreateFileW) X(ReadFile) X(SetFilePointer) X(GetFileSize)               \
-            X(DeviceIoControl) X(RegisterClassW) X(CreateWindowExW) X(DefWindowProcW) X(           \
-                DestroyWindow) X(IsWindow) X(PeekMessageW) X(TranslateMessage) X(DispatchMessageW) \
-                X(PostMessageW) X(PostQuitMessage) X(PostThreadMessageW) X(SetTimer) X(KillTimer)  \
-                    X(GetKeyState) X(SetKMode) X(SetProcPermissions) X(EnumFontFamiliesW) X(       \
-                        CreateFontIndirectW) X(CreateCompatibleDC) X(SelectObject) X(DeleteDC)     \
-                        X(GetVersionExW) X(SetRect) X(SetRectEmpty) X(CopyRect) X(IsRectEmpty)     \
-                            X(OffsetRect) X(InflateRect) X(IntersectRect) X(UnionRect)             \
-                                X(EqualRect) X(VirtualCopy) X(HalAllocateCommonBufferWithId) X(    \
-                                    HalAllocateCommonBuffer) X(HalFreeCommonBufferWithId)          \
-                                    X(HalFreeCommonBuffer) X(SetStoreQueueBase) X(NKDbgPrintfW) X( \
-                                        InterruptInitialize) X(InterruptDone) X(InterruptDisable)  \
-                                        X(GetSystemMetrics) X(GetDeviceCaps) X(GetWindowLongW)     \
-                                            X(SetWindowLongW) X(GetClassInfoW)                     \
-                                                X(SetForegroundWindow) X(SetFocus)                 \
-                                                    X(CreateBitmapFromPointer) X(DeleteObject)     \
-                                                        X(MmProbeAndLockPages) X(MmUnlockPages)    \
-                                                            X(HalMapInterrupt)
+#define WINCE_SYSTEM(X)                                                                           \
+    X(RegOpenKeyExW)                                                                              \
+    X(RegCreateKeyExW)                                                                            \
+    X(RegCloseKey)                                                                                \
+    X(RegQueryValueExW)                                                                           \
+    X(RegSetValueExW)                                                                             \
+    X(RegEnumKeyExW) X(RegQueryInfoKeyW) X(KernelIoControl) X(QueryAPISetID) X(CreateFileW)       \
+        X(ReadFile) X(SetFilePointer) X(GetFileSize) X(DeviceIoControl) X(RegisterClassW)         \
+            X(CreateWindowExW) X(DefWindowProcW) X(DestroyWindow) X(IsWindow) X(PeekMessageW) X(  \
+                TranslateMessage) X(DispatchMessageW) X(PostMessageW) X(PostQuitMessage)          \
+                X(PostThreadMessageW) X(SetTimer) X(KillTimer) X(GetKeyState) X(SetKMode) X(      \
+                    SetProcPermissions) X(EnumFontFamiliesW) X(CreateFontIndirectW)               \
+                    X(CreateCompatibleDC) X(SelectObject) X(DeleteDC) X(GetVersionExW) X(SetRect) \
+                        X(SetRectEmpty) X(CopyRect) X(IsRectEmpty) X(OffsetRect) X(InflateRect)   \
+                            X(IntersectRect) X(UnionRect) X(EqualRect) X(VirtualCopy)             \
+                                X(HalAllocateCommonBufferWithId) X(HalAllocateCommonBuffer)       \
+                                    X(HalFreeCommonBufferWithId) X(HalFreeCommonBuffer) X(        \
+                                        SetStoreQueueBase) X(NKDbgPrintfW) X(InterruptInitialize) \
+                                        X(InterruptDone) X(InterruptDisable) X(GetSystemMetrics)  \
+                                            X(GetDeviceCaps) X(GetWindowLongW) X(SetWindowLongW)  \
+                                                X(GetClassInfoW) X(SetForegroundWindow)           \
+                                                    X(SetFocus) X(CreateBitmapFromPointer)        \
+                                                        X(DeleteObject) X(MmProbeAndLockPages)    \
+                                                            X(MmUnlockPages) X(HalMapInterrupt)   \
+                                                                X(WriteFile) X(MapPtrToProcess)   \
+                                                                    X(GetCallerProcess)           \
+                                                                        X(PostKeybdMessage)
 #define ENUM(name) name,
 enum class Api { WINCE_SYSTEM(ENUM) Count };
 #undef ENUM
@@ -379,6 +383,117 @@ std::vector<std::uint32_t> SystemServices::due_interrupts(std::uint32_t istnrm,
     return events;
 }
 
+std::optional<bool> SystemServices::cd_request(std::uint32_t code, std::uint32_t in,
+                                               std::uint32_t in_size, std::uint32_t out,
+                                               std::uint32_t out_size, std::uint32_t& returned) {
+    if (cd_tracks_.empty())
+        return std::nullopt;
+    returned = 0;
+    // An absolute MSF address as a CD-ROM reports one: minutes, seconds, frames from FAD 0.
+    const auto msf = [](std::uint32_t lba) {
+        const std::uint32_t fad = lba + 150;
+        return std::array<std::uint8_t, 3>{static_cast<std::uint8_t>(fad / (75 * 60)),
+                                           static_cast<std::uint8_t>(fad / 75 % 60),
+                                           static_cast<std::uint8_t>(fad % 75)};
+    };
+    switch (code) {
+        case 0x24000: {  // IOCTL_CDROM_READ_TOC
+            // CDROM_TOC: Length[2] (big-endian, what follows it), FirstTrack, LastTrack, then
+            // 8-byte TRACK_DATA entries and the lead-out (0xAA). The high-density area only, as
+            // the GD-ROM driver reports it: MGameAudio insists on track 3 coming first.
+            std::vector<std::uint8_t> toc(4);
+            unsigned first = 0, last = 0;
+            for (const auto& t : cd_tracks_) {
+                if (t.number < 3)
+                    continue;
+                first = first ? first : t.number;
+                last = t.number;
+                const auto a = msf(t.lba);
+                // Reserved, Control (low nibble: 4 data, 0 audio) | Adr 1, TrackNumber,
+                // Reserved, Address[4] = 0, M, S, F.
+                toc.insert(toc.end(),
+                           {0, static_cast<std::uint8_t>((t.data ? 4 : 0) | 0x10),
+                            static_cast<std::uint8_t>(t.number), 0, 0, a[0], a[1], a[2]});
+            }
+            if (!first)
+                return false;
+            const auto lead = msf(cd_leadout_);
+            toc.insert(toc.end(), {0, 0x14, 0xAA, 0, 0, lead[0], lead[1], lead[2]});
+            const auto length = static_cast<std::uint32_t>(toc.size() - 2);
+            toc[0] = static_cast<std::uint8_t>(length >> 8);
+            toc[1] = static_cast<std::uint8_t>(length);
+            toc[2] = static_cast<std::uint8_t>(first);
+            toc[3] = static_cast<std::uint8_t>(last);
+            if (!out || out_size < 4)
+                return false;
+            returned = std::min<std::uint32_t>(out_size, static_cast<std::uint32_t>(toc.size()));
+            memory_.write_bytes(out, std::span<const std::uint8_t>(toc.data(), returned));
+            return true;
+        }
+        case 0x24018: {  // IOCTL_CDROM_PLAY_AUDIO_MSF: CDROM_PLAY_AUDIO_MSF {Start[3], End[3]}
+            if (!in || in_size < 6)
+                return false;
+            const auto fad = [&](std::uint32_t p) {
+                return memory_.read8(p) * 60u * 75u + memory_.read8(p + 1) * 75u +
+                       memory_.read8(p + 2);
+            };
+            const auto start = fad(in), end = fad(in + 3);
+            unsigned track = 0;
+            for (const auto& t : cd_tracks_)
+                if (t.lba + 150 <= start)
+                    track = t.number;
+            if (std::find(cd_plays_reported_.begin(), cd_plays_reported_.end(), track) ==
+                cd_plays_reported_.end()) {
+                cd_plays_reported_.push_back(track);
+                std::fprintf(stderr, "wince: CD audio: play track %u%s\n", track,
+                             cd_audio_ ? "" : " (not heard: no sound output)");
+            }
+            if (cd_audio_)
+                cd_audio_->play(start, end);
+            return true;
+        }
+        case 0x24004:  // IOCTL_CDROM_SEEK_AUDIO_MSF: playback stops there
+        case 0x24008:  // IOCTL_CDROM_STOP_AUDIO
+            if (cd_audio_)
+                cd_audio_->stop();
+            return true;
+        case 0x2400C:  // IOCTL_CDROM_PAUSE_AUDIO
+            if (cd_audio_)
+                cd_audio_->pause();
+            return true;
+        case 0x24010:  // IOCTL_CDROM_RESUME_AUDIO
+            if (cd_audio_)
+                cd_audio_->resume();
+            return true;
+        case 0x24028:  // IOCTL_CDROM_SET_VOLUME: VOLUME_CONTROL {PortVolume[4]}, 0-255
+            if (!in || in_size < 4)
+                return false;
+            for (unsigned i = 0; i < 4; ++i) cd_volume_[i] = memory_.read8(in + i);
+            if (cd_audio_)
+                cd_audio_->volume(cd_volume_[0], cd_volume_[1]);
+            return true;
+        case 0x24014:  // IOCTL_CDROM_GET_VOLUME: the same bytes; MGameAudio's sit at an odd address
+            if (!out || out_size < 4)
+                return false;
+            memory_.write_bytes(out, cd_volume_);
+            returned = 4;
+            return true;
+        default:
+            return std::nullopt;
+    }
+}
+
+bool SystemServices::close(std::uint32_t handle) {
+    const auto it = files_.find(handle);
+    if (it == files_.end())
+        return false;
+    const auto object = it->second.object;
+    files_.erase(it);
+    if (object && device_host_)
+        device_host_->close(object);
+    return true;
+}
+
 std::uint32_t SystemServices::enabled_of(std::uint32_t sysintr) {
     const auto it = enabled_.find(sysintr);
     if (it != enabled_.end())
@@ -677,14 +792,28 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
             result = kInvalid;
             if (fold(name).starts_with(u"\\device\\")) {
                 const auto handle = next_file_;
-                next_file_ += 4;
-                files_[handle] = File{name, true, nullptr, 0, 0};
                 // Drivers are opened again and again (input polling): each is reported once.
-                if (std::find(devices_opened_.begin(), devices_opened_.end(), fold(name)) ==
-                    devices_opened_.end()) {
+                const bool first = std::find(devices_opened_.begin(), devices_opened_.end(),
+                                             fold(name)) == devices_opened_.end();
+                if (first)
                     devices_opened_.push_back(fold(name));
-                    std::fprintf(stderr, "wince: open device \"%s\"\n", shown.c_str());
+                std::uint32_t object = 0, error = 0;
+                // A device no driver here serves (no GD-ROM drive yet) still opens, as before
+                // drivers ran: its requests are refused and reported instead.
+                if (device_host_ &&
+                    !(object = device_host_->open(name, arg(1), arg(5), handle, error)) &&
+                    error != 2 && error != 3) {
+                    if (first)
+                        std::fprintf(stderr, "wince: open device \"%s\": error %u\n", shown.c_str(),
+                                     error);
+                    last_error = error;
+                    break;
                 }
+                next_file_ += 4;
+                files_[handle] = File{name, true, nullptr, 0, 0, object};
+                if (first)
+                    std::fprintf(stderr, "wince: open device \"%s\"%s\n", shown.c_str(),
+                                 object ? " (driver)" : "");
                 result = handle;
                 break;
             }
@@ -725,6 +854,14 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                 break;
             }
             auto& file = it->second;
+            if (file.object && device_host_) {
+                std::uint32_t error = 0;
+                result = device_host_->read_write(file.object, false, arg(1), arg(2), arg(3),
+                                                  arg(4), error);
+                if (!result)
+                    last_error = error;
+                break;
+            }
             if (file.device || arg(4)) {
                 last_error = 1;  // ERROR_INVALID_FUNCTION: no sector reads, no overlapped I/O
                 break;
@@ -753,10 +890,12 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                 break;
             }
             auto& file = it->second;
-            std::int64_t distance = static_cast<std::int32_t>(arg(1));
-            if (arg(2))
-                distance = static_cast<std::int64_t>(
-                    (static_cast<std::uint64_t>(memory.read32(arg(2))) << 32) | arg(1));
+            // The console's file systems are 32-bit (a GD-ROM holds about a gigabyte): the
+            // distance is lDistanceToMove alone, signed, and *lpDistanceToMoveHigh only gets
+            // the result's high half. Sega Rally 2 passes the address of a stack word it never
+            // sets; adding that in sent the position gigabytes past the end of its car models,
+            // which then read back as zeros.
+            const std::int64_t distance = static_cast<std::int32_t>(arg(1));
             const std::int64_t from = arg(3) == 0   ? 0
                                       : arg(3) == 1 ? static_cast<std::int64_t>(file.position)
                                       : arg(3) == 2 ? static_cast<std::int64_t>(file.size)
@@ -788,16 +927,45 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
         }
         case Api::DeviceIoControl: {
             // (hDevice, dwIoControlCode, lpInBuffer, nInBufferSize, lpOutBuffer, nOutBufferSize,
-            //  lpBytesReturned, lpOverlapped). No device command is emulated yet: each code is
-            // refused and reported once, so the ones a title depends on show up.
+            //  lpBytesReturned, lpOverlapped). A driver's device gets it (DeviceHost); otherwise
+            // each code is refused and reported once, so the ones a title depends on show up.
             const auto it = files_.find(arg(0));
             const auto code = arg(1);
-            put32(arg(6), 0);
             result = 0;
             if (it == files_.end()) {
+                put32(arg(6), 0);
                 last_error = kInvalidHandle;
                 break;
             }
+            if (it->second.object && device_host_) {
+                std::uint32_t error = 0;
+                result = device_host_->control(it->second.object, code, arg(2), arg(3), arg(4),
+                                               arg(5), arg(6), arg(7), error);
+                if (!result)
+                    last_error = error;
+                break;
+            }
+            if (fold(it->second.name) == u"\\device\\cdrom0") {
+                std::uint32_t returned = 0;
+                if (const auto ok = cd_request(code, arg(2), arg(3), arg(4), arg(5), returned)) {
+                    put32(arg(6), returned);
+                    result = *ok;
+                    if (!*ok) {
+                        last_error = kInvalidParameter;
+                        break;
+                    }
+                    // Answered at once: an overlapped caller still waits on its event.
+                    if (const auto overlapped = arg(7)) {
+                        put32(overlapped, 0);             // Internal: STATUS_SUCCESS
+                        put32(overlapped + 4, returned);  // InternalHigh: bytes returned
+                        if (const auto event = memory.read32(overlapped + 16);
+                            event && signal_event_)
+                            signal_event_(event);
+                    }
+                    break;
+                }
+            }
+            put32(arg(6), 0);
             if (std::find(refused_device_ioctls_.begin(), refused_device_ioctls_.end(), code) ==
                 refused_device_ioctls_.end()) {
                 refused_device_ioctls_.push_back(code);
@@ -1438,6 +1606,38 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
             result = 0xE0000000u;
             break;
         }
+        case Api::WriteFile: {
+            // (hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped):
+            // drivers' devices only, the disc is read only.
+            const auto it = files_.find(arg(0));
+            result = 0;
+            if (it == files_.end()) {
+                put32(arg(3), 0);
+                last_error = kInvalidHandle;
+            } else if (it->second.object && device_host_) {
+                std::uint32_t error = 0;
+                result = device_host_->read_write(it->second.object, true, arg(1), arg(2), arg(3),
+                                                  arg(4), error);
+                if (!result)
+                    last_error = error;
+            } else {
+                put32(arg(3), 0);
+                last_error = 5;  // ERROR_ACCESS_DENIED
+            }
+            break;
+        }
+        case Api::MapPtrToProcess:
+            // (lpv, hProc): one process, so every pointer is already the caller's.
+            result = arg(0);
+            break;
+        case Api::GetCallerProcess:
+            result = Kernel::kProcessId;  // drivers run in the title's own process here
+            break;
+        case Api::PostKeybdMessage:
+            // (hwnd, vkey, flags, cCharacters, pShiftStateBuffer, pCharacterBuffer): a keyboard
+            // on the Maple bus. No keyboard is attached; accepted and dropped.
+            result = 1;
+            break;
         case Api::Count:
             return false;
     }

@@ -127,7 +127,9 @@ Steps 1 to 3 below on its own, in `launcher/importer.cpp`:
 Every session started from the launcher does Step 3 in small: the game runs with
 `--suggest-config`, and when it exits the launcher folds in what the session reached and builds the
 game again, so code played once runs translated the next time. Each step's output is in the
-launcher's log directory (`import-*.log`, `<id>-build.log`, `<id>-test.log`).
+launcher's log directory (`import-*.log`, `<id>-build.log`, `<id>-test.log`). A Windows CE
+title, whose configuration names its executable in a `[wince]` table, is run by `dream-wince`
+instead and is not built again (see [Windows CE](wince-support.md)).
 
 What it cannot do is judgement: a translation fault, a hang, wrong graphics. Those are the rest of
 this document. San Francisco Rush 2049, V-Rally 2 and the others in the README needed a person;

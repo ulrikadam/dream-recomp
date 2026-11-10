@@ -17,6 +17,7 @@ class Modules;
 class KernelServices;
 class Synchronization;
 class SystemServices;
+class DeviceHost;
 struct MemoryError : std::runtime_error {
     std::uint32_t code;
     MemoryError(std::uint32_t error, const char* message)
@@ -31,6 +32,9 @@ public:
     void install(const Image& image);
     std::uint32_t allocate(std::uint32_t bytes);
     bool release(std::uint32_t base);
+    // Bytes of the budget in use, and live allocate() blocks (at most 4096), for reports.
+    std::uint32_t used() const { return used_; }
+    std::uint32_t allocations() const { return allocation_count_; }
     // HLE Virtual* area, with 4 KiB pages and 64 KiB reservation alignment.
     std::uint32_t virtual_alloc(std::uint32_t address, std::uint32_t size, std::uint32_t type,
                                 std::uint32_t protection);
@@ -44,6 +48,7 @@ public:
     std::uint8_t read8(std::uint32_t a) override;
     std::uint16_t read16(std::uint32_t a) override;
     std::uint16_t fetch16(std::uint32_t a) override;
+    bool code_span(std::uint32_t a, CodeSpan& span) override;
     std::uint32_t read32(std::uint32_t a) override;
     std::uint64_t read64(std::uint32_t a) override;
     void write8(std::uint32_t a, std::uint8_t v) override;
@@ -66,14 +71,57 @@ public:
     // (a bus address in P2 or P4 form), through set_hardware's devices.
     void map_window(std::uint32_t base, std::uint32_t size, std::uint32_t target);
     std::size_t windows() const { return windows_.size(); }
+    // Accesses that missed the remembered region and took the long way, for reports.
+    mutable std::uint64_t slow_reads = 0, slow_fetches = 0, slow_writes = 0;
+    // For telling a busy-wait from work: writes outside [lo, lo + size) (the running thread's
+    // stack, as the caller sets it) and reads of the hardware, counted since the start. A loop
+    // that changes neither between two turns can only see something new once something else
+    // runs.
+    void set_quiet_window(std::uint32_t lo, std::uint32_t size) {
+        quiet_lo_ = lo;
+        quiet_size_ = size;
+    }
+    std::uint64_t outside_writes() const { return outside_writes_; }
+    std::uint64_t device_reads() const { return device_reads_; }
 
 private:
+    std::uint32_t quiet_lo_ = 0, quiet_size_ = 0;
+    std::uint64_t outside_writes_ = 0;
+    mutable std::uint64_t device_reads_ = 0;
     std::map<std::uint32_t, std::uint32_t> fixed_;
     struct Window {
         std::uint32_t size, target;
     };
     std::map<std::uint32_t, Window> windows_;
     std::optional<std::uint32_t> window_target(std::uint32_t address) const;
+    bool touches_window(std::uint32_t address, std::uint32_t size) const;
+    // The regions accesses fell in lately, each kept under the 4 KiB page an access was in, when
+    // no window lies over it: the next access in one goes straight to its bytes. Nearly all do.
+    // One region was not enough: the stack, the heap, a module's data and the code of two
+    // modules take turns, and one access in five took the long way. Anything that adds, removes
+    // or re-protects a region or a window forgets them all.
+    struct Hit {
+        std::uint32_t base = 0, size = 0;
+        std::uint8_t* bytes = nullptr;
+        unsigned permissions = 0;
+    };
+    static constexpr std::size_t kHits = 256;
+    mutable std::array<Hit, kHits> hits_{}, fetch_hits_{};  // data accesses, instruction fetches
+    Hit& hit_for(std::uint32_t address, bool fetch = false) const {
+        return (fetch ? fetch_hits_ : hits_)[(address >> 12) & (kHits - 1)];
+    }
+    void remember(std::uint32_t address, Hit& into) const;
+    // A remembered region read without the long way; false sends the access to load().
+    template <typename T>
+    bool quick_read(std::uint32_t address, T& value) const;
+    template <typename T>
+    bool quick_write(std::uint32_t address, T value);
+    void forget() const {
+        hits_.fill({});
+        fetch_hits_.fill({});
+        ++generation_;  // code spans handed out are stale too
+    }
+    mutable std::uint64_t generation_ = 0;
     Hardware* hardware_ = nullptr;
     struct Region {
         std::vector<std::uint8_t> bytes;
@@ -129,6 +177,11 @@ public:
     bool deliver_interrupts(std::uint32_t istnrm, std::uint32_t istext, std::uint32_t isterr,
                             bool wake);
     std::map<std::uint32_t, std::uint64_t> interrupt_counts() const;  // SYSINTR -> deliveries
+    // The registry, files and devices; made on first use (needs set_scheduler's memory or a
+    // first service call). Null before either.
+    SystemServices* system_services();
+    // Drivers serving "\Device\..." in the process (see DeviceHost).
+    void set_device_host(DeviceHost* host);
     static constexpr std::uint32_t kKData = 0x5800, kProcessId = 1;
     const std::vector<std::u16string>& debug_messages() const;
 
@@ -136,6 +189,8 @@ private:
     std::unique_ptr<KernelServices> services_;
     std::unique_ptr<Synchronization> synchronization_;
     std::unique_ptr<SystemServices> system_;
+    DeviceHost* device_host_ = nullptr;
+    void make_system(ProcessMemory& memory);
     std::filesystem::path file_root_;
     GuestCall guest_call_;
     ClassResolver class_resolver_;
