@@ -48,6 +48,14 @@ std::string boot_executable(std::string_view id) {
 #endif
 }
 
+std::string wince_executable() {
+#ifdef _WIN32
+    return "dream-wince.exe";
+#else
+    return "dream-wince";
+#endif
+}
+
 std::optional<Game> read_game(const fs::path& config, const fs::path& build_dir,
                               std::string* error) {
     toml::parse_result r = toml::parse_file(config.string());
@@ -72,9 +80,16 @@ std::optional<Game> read_game(const fs::path& config, const fs::path& build_dir,
     g.config = config;
     g.exe = build_dir / "games" / g.id / boot_executable(g.id);
     std::error_code ec;
-    g.built = fs::is_regular_file(g.exe, ec);
-    const std::string image = t["disc"]["image"].value_or(std::string{});
-    g.disc = !image.empty() && fs::is_regular_file(config.parent_path() / image, ec);
+    if (const std::string wince = t["wince"]["executable"].value_or(std::string{});
+        !wince.empty()) {
+        g.wince = config.parent_path() / wince;
+        g.exe = build_dir / "tools" / "wince" / wince_executable();
+    }
+    g.built =
+        fs::is_regular_file(g.exe, ec) && (g.wince.empty() || fs::is_regular_file(g.wince, ec));
+    if (const std::string image = t["disc"]["image"].value_or(std::string{}); !image.empty())
+        g.image = config.parent_path() / image;
+    g.disc = !g.image.empty() && fs::is_regular_file(g.image, ec);
     return g;
 }
 

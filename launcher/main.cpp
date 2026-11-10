@@ -756,25 +756,36 @@ void run_game(rd::vk::Window& w, const Options& o, const Game& g, State& s) {
     fs::create_directories(o.saves, ec);
     fs::create_directories(o.logs, ec);
     const Slots cards = s.ports;
-    std::vector<std::string> args = {utf8(g.exe), "--config",  utf8(g.config),
-                                     "--window",  "--vmu-dir", utf8(o.saves)};
-    if (!cards[0].empty()) {
-        args.push_back("--vmu");
-        args.push_back(utf8(o.saves / cards[0]));
+    std::vector<std::string> args;
+    if (!g.wince.empty()) {
+        // A Windows CE title: dream-wince runs the disc's own executable, DLLs, DirectDraw and
+        // DirectSound; an import it lacks stops the run only if it is called. One card, in A1.
+        args = {utf8(g.exe),      "--run",    utf8(g.wince), "--lazy",
+                "--real-directx", "--window", "--disc",      utf8(g.image)};
+        if (!cards[0].empty()) {
+            args.push_back("--vmu");
+            args.push_back(utf8(o.saves / cards[0]));
+        }
+    } else {
+        args = {utf8(g.exe), "--config", utf8(g.config), "--window", "--vmu-dir", utf8(o.saves)};
+        if (!cards[0].empty()) {
+            args.push_back("--vmu");
+            args.push_back(utf8(o.saves / cards[0]));
+        }
+        if (!cards[1].empty()) {
+            args.push_back("--vmu2");
+            args.push_back(utf8(o.saves / cards[1]));
+        }
+        if (!o.ui_assets.empty()) {
+            args.push_back("--ui-assets");
+            args.push_back(utf8(o.ui_assets));
+        }
+        // What the session reaches that the translation lacks, for after_play.
+        const fs::path suggest = o.logs / (g.id + "-play-suggest.toml");
+        fs::remove(suggest, ec);
+        args.push_back("--suggest-config");
+        args.push_back(utf8(suggest));
     }
-    if (!cards[1].empty()) {
-        args.push_back("--vmu2");
-        args.push_back(utf8(o.saves / cards[1]));
-    }
-    if (!o.ui_assets.empty()) {
-        args.push_back("--ui-assets");
-        args.push_back(utf8(o.ui_assets));
-    }
-    // What the session reaches that the translation lacks, for after_play.
-    const fs::path suggest = o.logs / (g.id + "-play-suggest.toml");
-    fs::remove(suggest, ec);
-    args.push_back("--suggest-config");
-    args.push_back(utf8(suggest));
     std::vector<const char*> argv;
     for (const std::string& a : args) argv.push_back(a.c_str());
     argv.push_back(nullptr);
@@ -1007,6 +1018,8 @@ void start_import(Import& imp, const Options& o, const std::string& disc) {
 // the interpreter. A configuration newer than the executable (a build stopped half way, or
 // launched without the compilers) is built too.
 void after_play(Import& imp, State& s, const Options& o, const Game& g) {
+    if (!g.wince.empty())
+        return;  // a Windows CE title has no translation to improve
     const dream::launcher::Findings f =
         dream::launcher::fold_findings(g.config, o.logs / (g.id + "-play-suggest.toml"));
     if (!f.error.empty()) {

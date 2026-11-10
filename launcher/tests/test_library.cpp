@@ -62,6 +62,27 @@ TEST_CASE("a game reads its title, status, executable and disc") {
     CHECK(g->disc);
 }
 
+TEST_CASE("a Windows CE title runs on dream-wince, with the executable on its disc") {
+    Tree t;
+    t.write("games/rally/rally.toml",
+            "[game]\nid = \"rally\"\ntitle = \"Rally\"\n[disc]\nimage = \"disc/r.gdi\"\n"
+            "[wince]\nexecutable = \"extracted/fs/RALLY.EXE\"\n");
+    t.write("games/rally/disc/r.gdi", "1\n");
+    t.write("build/games/rally/" + boot_executable("rally"), "");  // not what runs it
+    std::string error;
+    auto g = read_game(t.root / "games/rally/rally.toml", t.root / "build", &error);
+    REQUIRE_MESSAGE(g, error);
+    CHECK(g->exe == t.root / "build/tools/wince" / wince_executable());
+    CHECK(g->wince == t.root / "games/rally/extracted/fs/RALLY.EXE");
+    CHECK(g->image == t.root / "games/rally/disc/r.gdi");
+    CHECK(g->disc);
+    CHECK_FALSE(g->built);  // neither dream-wince nor the title's executable yet
+    t.write("build/tools/wince/" + wince_executable(), "");
+    CHECK_FALSE(read_game(t.root / "games/rally/rally.toml", t.root / "build")->built);
+    t.write("games/rally/extracted/fs/RALLY.EXE", "");
+    CHECK(read_game(t.root / "games/rally/rally.toml", t.root / "build")->built);
+}
+
 TEST_CASE("scan skips directories without a config and sorts by title") {
     Tree t;
     t.write("games/zeta/zeta.toml", "[game]\nid = \"zeta\"\ntitle = \"Beta\"\n");

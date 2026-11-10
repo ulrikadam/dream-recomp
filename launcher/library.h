@@ -8,6 +8,13 @@
 //   [status]
 //   level = "playable"   # playable, ingame, boots, nothing, unsupported
 //   note = "Menus, memory card, races and sound."
+//
+// A Windows CE title is not translated: dream-wince (tools/wince in the build) runs the
+// executable on its extracted disc, which an optional [wince] table names, relative to the
+// configuration:
+//
+//   [wince]
+//   executable = "extracted/fs/RALLY2.EXE"
 #pragma once
 
 #include <filesystem>
@@ -30,13 +37,17 @@ struct Game {
     std::string id, title, region, product, note;
     Level level = Level::Unknown;
     std::filesystem::path config;  // games/<id>/<id>.toml
-    std::filesystem::path exe;     // where the build puts <id>_boot
-    bool built = false;            // that executable exists
-    bool disc = false;             // the disc image the configuration names exists
+    std::filesystem::path exe;     // what runs it: where the build puts <id>_boot, or dream-wince
+    std::filesystem::path wince;   // a Windows CE title's executable; empty for the others
+    std::filesystem::path image;   // the disc image the configuration names
+    bool built = false;            // that executable exists (and the title's, for WinCE)
+    bool disc = false;             // the disc image exists
 };
 
 // The executable's name for a game id, with the platform's suffix.
 std::string boot_executable(std::string_view id);
+// dream-wince's file name, with the platform's suffix.
+std::string wince_executable();
 
 // One game from its configuration file. `build_dir` is the CMake build directory, where the
 // executable is looked for. Empty, with the reason in `error`, when the file does not parse or
