@@ -1,0 +1,34 @@
+# SEGA RALLY 2, MK-51006-50 (PAL). A Windows CE title: the boot file is the WinCE kernel, and the
+# game itself is in .EXE and .DLL files the kernel loads with the MMU on. It is not translated:
+# dream-wince runs RALLY2.EXE and the disc's DLLs (the [wince] table below; the launcher starts it
+# with --lazy --real-directx --window --disc). The [binary] table only remains so the old kernel
+# experiment (segarally2_boot) still builds.
+#
+# Setting it up with your own disc (`dcdisc new-game` refuses Windows CE discs): put the GDI image
+# and its tracks in games/segarally2/disc/ as segarally2.gdi, then
+#   dcdisc extract games/segarally2/disc/segarally2.gdi games/segarally2/extracted
+# Both folders are gitignored. See docs/wince-support.md.
+
+[game]
+id = "segarally2"
+title = "Sega Rally 2"
+region = "Europe"
+product = "MK-51006-50"
+
+[disc]
+image = "disc/segarally2.gdi"
+
+[binary]
+path = "extracted/fs/0WINCEOS.BIN"
+load_address = 0x8C010000
+link_address = 0x8C010000    # its pointers are P1 addresses
+entry = 0x8C010000
+
+# Run by dream-wince, not translated.
+[wince]
+executable = "extracted/fs/RALLY2.EXE"
+
+# How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
+[status]
+level = "playable"
+note = "Windows CE title, run by dream-wince: menus, memory card, races at full speed, CD music and sound effects. The car and name selection screens run at about 0.8 speed and stutter."

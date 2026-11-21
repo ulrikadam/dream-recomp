@@ -123,7 +123,11 @@ build/tools/wince/dream-wince --run games/<id>/extracted/fs/<GAME>.EXE --lazy --
 
 The launcher starts a Windows CE title the same way when its `games/<id>/<id>.toml` has a
 `[wince] executable = "extracted/fs/<GAME>.EXE"` table; AJOUTER UN JEU does not write one yet, so
-for now that configuration is written by hand. Everything that went into it, and the bring-up aids
+for now that configuration is written by hand. Sega Rally 2's is in the repository
+([games/segarally2](games/segarally2/segarally2.toml)): put your own disc's GDI image and tracks in
+`games/segarally2/disc/` as `segarally2.gdi`, extract it with
+`dcdisc extract games/segarally2/disc/segarally2.gdi games/segarally2/extracted`, build, and it
+shows in JOUER. Everything that went into it, and the bring-up aids
 (`DREAM_WINCE_PROFILE`, `DREAM_WINCE_FRAMES`, `DREAM_WINCE_WAV`, `DREAM_WINCE_STATUS`, traces of the
 Maple bus, the drivers and the interpreter), is in [docs/wince-support.md](docs/wince-support.md).
 The interpreter's speed work is in [docs/runtime-devinterp.md](docs/runtime-devinterp.md#speed-2026-11-10).
