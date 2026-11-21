@@ -13,6 +13,12 @@ public:
     // Store queues (0xE0000000-0xE3FFFFFF and PREF): how drivers feed the TA FIFO.
     virtual bool store_queue_write(std::uint32_t, std::uint32_t) { return false; }
     virtual bool store_queue_flush(std::uint32_t) { return false; }
+    // An ordinary 32-bit store to the store-queue area (MOV.L there): write()'s effect, which a
+    // device may give without decoding the address again. Drivers send the TA its vertices
+    // this way, tens of millions of words a minute.
+    virtual bool store_queue_store(std::uint32_t address, std::uint32_t value) {
+        return write(address, 4, value);
+    }
     // SetStoreQueueBase: from now on the whole store-queue area maps onto `physical` onward, in
     // 1 MiB pages, as the kernel's TLB miss handler maps it.
     virtual bool store_queue_base(std::uint32_t) { return false; }

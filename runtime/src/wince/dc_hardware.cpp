@@ -123,17 +123,16 @@ void DcHardware::advance_to(std::uint64_t cycles) {
 }
 
 namespace {
-// DREAM_WINCE_TRACE_HW=physical address: print the first accesses to that register.
-std::uint32_t traced() {
-    static const std::uint32_t address = [] {
-        const char* v = std::getenv("DREAM_WINCE_TRACE_HW");
-        return v ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 0)) & 0x1FFFFFFFu : 0u;
-    }();
-    return address;
-}
-void trace(const char* what, std::uint32_t address, unsigned size, std::uint64_t value) {
-    static unsigned shown = 0;
-    if (traced() && (address & 0x1FFFFFFFu) == traced() && shown++ < 40)
+// DREAM_WINCE_TRACE_HW=physical address: print the first accesses to that register. Read once,
+// at start-up: the test is made on every device access, and a function-local static's guard
+// cost more than the test itself.
+const std::uint32_t traced_address = [] {
+    const char* v = std::getenv("DREAM_WINCE_TRACE_HW");
+    return v ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 0)) & 0x1FFFFFFFu : 0u;
+}();
+unsigned trace_shown = 0;
+inline void trace(const char* what, std::uint32_t address, unsigned size, std::uint64_t value) {
+    if (traced_address && (address & 0x1FFFFFFFu) == traced_address && trace_shown++ < 40)
         std::fprintf(stderr, "hw: %s%u 0x%08x = 0x%llx\n", what, size * 8, address,
                      static_cast<unsigned long long>(value));
 }
@@ -193,6 +192,15 @@ bool DcHardware::write(std::uint32_t address, unsigned size, std::uint64_t value
 }
 
 bool DcHardware::store_queue_write(std::uint32_t address, std::uint32_t value) {
+    system_->memory.sq_write32(address, value);
+    return true;
+}
+// What write(address, 4, value) does there: the port pair is elsewhere, and the bus puts the word
+// in SQ0 or SQ1 (address bit 5) as sq_write32 does, with nothing to note (no journal, write hash
+// or watch in a CE process).
+bool DcHardware::store_queue_store(std::uint32_t address, std::uint32_t value) {
+    ++accesses_;
+    trace("write", address, 4, value);
     system_->memory.sq_write32(address, value);
     return true;
 }

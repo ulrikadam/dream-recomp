@@ -36,7 +36,7 @@ its `games/<id>/<id>.toml` records how far it gets.
 | Sega GT (PAL) | Recompiled | Playable | Intro movie, menus, a full race. |
 | 18 Wheeler: American Pro Trucker (PAL) | Recompiled | Playable | Menus, truck select, races. |
 | V-Rally 2 Expert Edition (PAL) | Recompiled | Playable | Menus, memory card, races, sound. |
-| **Sega Rally 2 (PAL)** | **Windows CE** | **Playable** | Menus, memory card, races at the console's speed, CD music and sound effects. The car and name selection screens run at about 0.8 of the console's speed and stutter. |
+| **Sega Rally 2 (PAL)** | **Windows CE** | **Playable** | Menus, memory card, car and name selection, races: all at the console's speed, with CD music and sound effects. |
 | Worms Armageddon (PAL) | Windows CE | In progress | Starts and loads its first files; its intro movie stays black (its sound does not start yet). |
 | Tokyo Highway Challenge (PAL) | Recompiled | Boots | Added by the launcher alone, first try; played once, not yet rated. |
 | Crazy Taxi (USA), Rez, Ikaruga | Recompiled | From upstream | Not re-tested here. |
@@ -137,13 +137,14 @@ The interpreter's speed work is in [docs/runtime-devinterp.md](docs/runtime-devi
 Work that is ready to pick up. Each item says where to start; the docs it points to say what has
 been tried. Open an issue before a large change, so two people do not take the same one.
 
-- **Windows CE speed.** `dream-wince` interprets every instruction (about 60 million a second).
-  Races keep the console's pace, but heavy 3D scenes run at about 0.8 of it: Sega Rally 2's car
-  and name selection screens. Much of that time goes to a few hand-written per-vertex lighting and
-  vertex routines (MGameGL around +0xc580, DDHAL around +0x18480 and +0x13ac0). Options, from
-  smallest to largest: native versions of those routines, checked bit for bit against the
-  interpreter; a block-level interpreter; recompiling the CE modules with the existing translator.
-  `DREAM_WINCE_PROFILE=64` names the hot guest code.
+- **Windows CE speed.** `dream-wince` interprets every instruction (about 100 million a second
+  in Sega Rally 2's heaviest scenes). The whole title now keeps the console's pace, but with only
+  a tenth to spare in its car and name selection screens, so a slower PC will not. Much of that
+  time goes to a few hand-written per-vertex lighting and vertex routines (MGameGL around +0xc580,
+  DDHAL around +0x18480 and +0x13ac0). Options, from smallest to largest: native versions of those
+  routines, checked bit for bit against the interpreter; a block-level interpreter; recompiling
+  the CE modules with the existing translator. `DREAM_WINCE_PROFILE=64` names the hot guest code,
+  `DREAM_WINCE_FRAMES=300` the instructions and host time of every 300 frames.
 - **Worms Armageddon.** It reaches its intro movie (CRI Sofdec), which stays black: its sound never
   starts, and Sofdec times its frames from its ADX sound. With the movies left out it draws its
   first screens and then writes through a null pointer. Details in

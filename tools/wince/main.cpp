@@ -422,6 +422,9 @@ int main(int argc, char** argv) {
             return v ? static_cast<unsigned>(std::atoi(v)) : 0u;
         }();
         std::uint64_t renders_before = 0;
+        // And the guest instructions run in them (set once the slices' count exists, below).
+        const std::uint64_t* instructions_run = nullptr;
+        std::uint64_t instructions_before = 0;
 #ifdef DREAM_WINCE_WINDOW
         double waited_before = 0;
 #endif
@@ -448,6 +451,17 @@ int main(int argc, char** argv) {
                         static_cast<unsigned long long>(frame),
                         static_cast<unsigned long long>(hardware.pvr().renders - renders_before),
                         std::chrono::duration<double>(now - frames_wall).count());
+                    if (instructions_run) {
+                        std::fprintf(
+                            stderr, ", %.0f M instructions",
+                            static_cast<double>(*instructions_run - instructions_before) / 1e6);
+                        instructions_before = *instructions_run;
+                    }
+                    // The frame rate the title set (SPG_LOAD), so the time above can be read
+                    // against the console's: N frames take N / rate seconds there.
+                    if (const auto cycles = hardware.system().spg.frame_cycles())
+                        std::fprintf(stderr, ", %.2f Hz",
+                                     static_cast<double>(dream::sched::kSh4Clock) / cycles);
                     if (waited >= 0)
                         std::fprintf(stderr, " (%.1f s waiting)", waited);
 #ifdef DREAM_WINCE_AUDIO
@@ -961,6 +975,7 @@ int main(int argc, char** argv) {
         dream::devinterp::Options sliced = options;
         sliced.max_instructions = kSlice;
         std::uint64_t executed = 0, thread_instructions = 0;
+        instructions_run = &executed;
         std::atomic<std::uint64_t> progress{0};  // what the watchdog watches
         // DREAM_WINCE_PROFILE=N: where the time goes, the PC where each run of guest code
         // stopped (a time slice ends anywhere) weighed by the instructions it ran, in buckets of
@@ -970,12 +985,19 @@ int main(int argc, char** argv) {
         if (bucket < 2 || (bucket & (bucket - 1)))
             bucket = 256;
         std::map<std::uint32_t, std::uint64_t> samples;
+        // DREAM_WINCE_PROFILE_FROM=F: only from vertical blank F on (and up to the step limit),
+        // to look at one scene of a title rather than its whole start.
+        const std::uint64_t profile_from = [] {
+            const char* v = std::getenv("DREAM_WINCE_PROFILE_FROM");
+            return v ? std::strtoull(v, nullptr, 0) : 0ull;
+        }();
         auto run_sliced = [&](dream::sh4::Ctx& ctx, std::uint32_t return_to,
                               dream::devinterp::Stats& total) {
             for (;;) {
                 dream::devinterp::Stats slice;
                 const auto stop = dream::devinterp::run(ctx, memory, return_to, sliced, &slice);
-                if (profile)  // weighed by what ran: short nested runs end in the same few places
+                // Weighed by what ran: short nested runs end in the same few places.
+                if (profile && hardware.system().spg.frames() >= profile_from)
                     samples[ctx.pc & ~(bucket - 1)] += slice.instructions;
                 executed += slice.instructions;
                 progress.store(executed, std::memory_order_relaxed);
@@ -1430,9 +1452,16 @@ int main(int argc, char** argv) {
             std::sort(busiest.rbegin(), busiest.rend());
             std::uint64_t all = 0;
             for (const auto& [n, pc] : busiest) all += n;
-            for (std::size_t i = 0; i < busiest.size() && i < 25; ++i)
-                std::cout << "profile: " << where(busiest[i].second) << " "
-                          << busiest[i].first * 100 / std::max<std::uint64_t>(all, 1) << "%\n";
+            // DREAM_WINCE_PROFILE_TOP=N: that many buckets instead of 25.
+            const char* top_text = std::getenv("DREAM_WINCE_PROFILE_TOP");
+            const std::size_t top = top_text ? std::strtoul(top_text, nullptr, 0) : 25;
+            for (std::size_t i = 0; i < busiest.size() && i < top; ++i) {
+                char share[16];
+                std::snprintf(share, sizeof share, "%.1f%%",
+                              static_cast<double>(busiest[i].first) * 100.0 /
+                                  static_cast<double>(std::max<std::uint64_t>(all, 1)));
+                std::cout << "profile: " << where(busiest[i].second) << " " << share << "\n";
+            }
             const auto seconds = [](std::chrono::steady_clock::duration d) {
                 return std::chrono::duration<double>(d).count();
             };

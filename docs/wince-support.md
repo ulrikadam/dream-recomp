@@ -390,7 +390,8 @@ F12 writes `screenshot-wince-NNN.ppm` in the working directory, as does
 drawn but not written back to video memory.
 
 The interpreter runs about 60 million guest instructions a second, under a third of the console
-([runtime-devinterp.md](runtime-devinterp.md), Speed; 28 million before), but a title's menus
+([runtime-devinterp.md](runtime-devinterp.md), Speed; 28 million before, and about 100 million
+in floating-point-heavy scenes since its second round), but a title's menus
 need far fewer than the console offers: most of the time they wait for the graphics hardware.
 Sega Rally 2 asks `while (FAILED(d3d->Flip()));` (RALLY2.EXE), and
 DirectDraw answers `DDERR_WASSTILLDRAWING` until the flip happened at the vertical blank: two
@@ -428,18 +429,20 @@ while the guest's clock (200 MHz) is ahead of the wall's. A guest more than 100 
 load, a heavy scene) is not made to race to catch up afterwards. Sega Rally 2 shows PRESS START
 BUTTON a few seconds after it starts, and its menus run at the console's pace. In a window
 `DREAM_WINCE_FRAMES` also prints the time spent waiting so (`frames 4200: 300 renders in 5.0 s
-(1.0 s waiting)`): the room left. Its race keeps the console's pace with about a fifth of the
-time to spare (a tenth at the start, every car in view); the loading before it runs at about 0.8.
+(1.0 s waiting)`): the room left. Its race keeps the console's pace with about a third of the
+time to spare, and so do its car and name selection screens, with less (a tenth in the heaviest
+300 frames; see Speed, second round, below).
 
 With sound, the sound device's clock paces the window instead (`LiveWindow::set_pacer`), as
 `boot_main` does for the Katana titles: at each vertical blank the guest waits while the effects'
 queue holds more than `Sink::kPaceFrames` (about 93 ms), so a slow frame eats into that rather
 than cutting the sound. Paced by the wall clock the queue held only the 46 ms cushion a gap
 leaves, and a slow frame in the race cut the engine. The frames line then also counts the gaps
-(`sound gaps N`). What is left: where the guest is slower than the console for longer (the car
-and name selection screens, about 0.8, their 3D car and per-vertex lighting in MGameGL and
-DDHAL; a heavy moment of a race now that the sound works, the race having less room than
-before), the queue empties and the sound breaks up. Only more speed mends that.
+(`sound gaps N`). Where the guest is slower than the console for longer, the queue empties and
+the sound breaks up; only more speed mends that. The car and name selection screens did (about
+0.8 of the console's speed, their 3D car and per-vertex lighting in MGameGL and DDHAL) until the
+second round of speed-ups below; since, a run from the title screen through the selections into
+a race has no gap.
 
 A window has sound (`--no-audio` turns it off; a run without a window is silent), in two parts
 that the sound device mixes:
@@ -483,6 +486,40 @@ loops), the call sites whose polls were skipped, the host's time split between t
 services and the console hardware (the rest is the interpreter), the costliest services with
 their calls, and the accesses that took the long way. On Sega Rally 2's menus the services take
 about 1.3 seconds of 36 and the hardware 0.6: the interpreter is what is slow.
+`DREAM_WINCE_PROFILE_FROM=F` counts only from vertical blank F on, to look at one scene rather
+than a title's whole start, and `DREAM_WINCE_PROFILE_TOP=N` prints N buckets instead of 25, with
+their shares to a tenth of a percent.
+
+### Speed, second round (2026-11-21)
+
+The frames line (`DREAM_WINCE_FRAMES`) also gives the guest instructions run in those frames and
+the frame rate the title set (from `SPG_LOAD`): `frames 2400: 248 renders in 4.6 s, 535 M
+instructions, 59.95 Hz`. Sega Rally 2 runs at 59.95 Hz, so 300 frames take 5.0 seconds on the
+console, and its car and name selection screens run 535 million instructions in them, twice its
+race's 250 million. They took 6 seconds without a window.
+
+- **the interpreter**, 1.7 times faster on DDHAL's clip test loop, one of those screens' busiest:
+  one dispatch for an instruction, decoded instructions used in place, `exec` inlined, the code span
+  checked where it can change ([the dev interpreter](runtime-devinterp.md), Speed, second round);
+- **a short way into the store queues.** Of the 94 million writes that took the long way
+  (`slow memory accesses` in the profile), 86 million were ordinary stores (MOV.L) into the
+  store-queue area, 0xE0000000 to 0xE3FFFFFF: DDHAL filling the queues with vertices before each
+  PREF. Each went through `ProcessMemory::store`, `DcHardware::write`, its port pair and trace
+  test, and `DcMemory`'s address decoding, to land as one word in SQ0 or SQ1.
+  `Hardware::store_queue_store` takes them from `store` straight to the queues, with the same
+  device-access count and trace, and the same word (`test_wince_hardware`). The hardware trace's
+  address (`DREAM_WINCE_TRACE_HW`) is read once at start-up rather than through a function-local
+  static's guard on every device access;
+- **the AICA's DSP runs its programme up to the last non-empty step.** It went through its 128
+  steps for every sample; the empty steps after the last instruction only set X, Y and ACC, which
+  nothing reads before the next sample starts them at zero again (`test_mixer`). The title's sound
+  recorded with `DREAM_WINCE_WAV` is the same file, byte for byte, as before the change.
+
+Without a window, the selection's heaviest 600 frames went from 11.8 to 8.9 seconds (10 on the
+console) and the race's 300 frames from about 3.7 to 3.0, with the same renders in the same frames.
+In a window every 300 frames from the title screen to the race take the console's 5.0 seconds,
+waiting 0.4 seconds in the heaviest (frames 2100 to 2400) and 1.5 to 2 in the race, with no sound
+gap.
 `DREAM_WINCE_PRESS=start@N,...` presses pad buttons at given frames. `DREAM_WINCE_REGS` adds the
 registers to the message of a failure on any thread.
 
@@ -498,11 +535,13 @@ What took Sega Rally 2 from ARCADE to a race:
 - the compiler's float conversions `_itos` and `_utos` (R4 to FR0) and `_stoi` and `_stou` (FR4
   to R0, truncated, saturating as FTRC does).
 
-Next for speed: the race keeps the console's pace in a window, with little room at its start;
-what is left is the interpreter's dispatch, one instruction at a time (the WinCE executables are
-not statically recompiled). Also open: WDMLIB's `KernelIoControl(1)`, a BIOS MISC call 1 (return
-to the console menu) during start-up that is ignored, and what the title asks when a track ends
-(not yet seen: a menu track lasts minutes).
+Next for speed: the whole title keeps the console's pace in a window, with a tenth to spare in
+the heaviest selection screen, less on a slower host; what is left is the interpreter's dispatch,
+one instruction at a time (the WinCE executables are not statically recompiled), and the AICA's
+ARM7 and DSP, about a quarter of the time where the guest does little (the menus). Also open:
+WDMLIB's `KernelIoControl(1)`, a BIOS MISC call 1 (return to the console menu) during start-up
+that is ignored, and what the title asks when a track ends (not yet seen: a menu track lasts
+minutes).
 
 ### Sound effects (2026-11-21)
 

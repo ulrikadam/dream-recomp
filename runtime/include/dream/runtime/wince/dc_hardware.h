@@ -31,6 +31,7 @@ public:
     bool read(std::uint32_t address, unsigned size, std::uint64_t& value) override;
     bool write(std::uint32_t address, unsigned size, std::uint64_t value) override;
     bool store_queue_write(std::uint32_t address, std::uint32_t value) override;
+    bool store_queue_store(std::uint32_t address, std::uint32_t value) override;
     bool store_queue_flush(std::uint32_t address) override;
     bool store_queue_base(std::uint32_t physical) override;
     void advance_to(std::uint64_t cycles);

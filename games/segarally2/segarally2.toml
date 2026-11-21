@@ -31,4 +31,4 @@ executable = "extracted/fs/RALLY2.EXE"
 # How far the game gets, for the launcher: playable, ingame, boots, nothing or unsupported.
 [status]
 level = "playable"
-note = "Windows CE title, run by dream-wince: menus, memory card, races at full speed, CD music and sound effects. The car and name selection screens run at about 0.8 speed and stutter."
+note = "Windows CE title, run by dream-wince: menus, memory card, car and name selection and races at full speed, CD music and sound effects."

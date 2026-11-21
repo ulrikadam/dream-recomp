@@ -393,6 +393,11 @@ void ProcessMemory::store(std::uint32_t a, std::uint64_t v, unsigned size) {
         return;
     }
     ++slow_writes;
+    if (size == 4 && (a >> 26) == 0x38u && hardware_ &&  // 0xE0000000-0xE3FFFFFF
+        hardware_->store_queue_store(a, static_cast<std::uint32_t>(v))) {
+        outside_writes_ += outside;  // the hardware: work, as below
+        return;
+    }
     if (a >= 0x80000000u && hardware_ && hardware_->write(a, size, v)) {
         outside_writes_ += outside;  // the hardware: work
         return;

@@ -38,6 +38,29 @@ TEST_CASE("wince hardware: the whole store-queue area follows SetStoreQueueBase"
     CHECK(hw.system().memory.sq_tlb_misses == 0);
 }
 
+TEST_CASE("wince hardware: plain stores into the store queues reach the bus as the SQ path's") {
+    // ddhal fills the store queues with ordinary MOV.L stores (process writes to 0xE0000000 and
+    // up), tens of millions of words a minute; they take a short way to the queues
+    // (Hardware::store_queue_store) and must land as the bus would have put them: SQ0 or SQ1 by
+    // address bit 5, the word by bits 2-4, then PREF sends the 32 bytes.
+    DcHardware hw([] { return std::uint64_t{0}; });
+    dream::wince::ProcessMemory memory;
+    memory.set_hardware(&hw);
+    REQUIRE(hw.store_queue_base(0x0C000000u));
+    const auto before = hw.accesses();
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        memory.write32(0xE0000020u + 4 * i, 0x300 + i);  // SQ1
+        memory.write32(0xE0000000u + 4 * i, 0x400 + i);  // SQ0
+    }
+    CHECK(hw.accesses() - before == 16);  // each one a device access, as before
+    memory.sq_flush(0xE0000020u);
+    memory.sq_flush(0xE0000000u);
+    CHECK(ram_word(hw, 0x000020) == 0x300);
+    CHECK(ram_word(hw, 0x00003C) == 0x307);
+    CHECK(ram_word(hw, 0x000000) == 0x400);
+    CHECK(ram_word(hw, 0x00001C) == 0x407);
+}
+
 TEST_CASE("wince hardware: locked pages follow the process memory they copy") {
     // MmProbeAndLockPages copies process memory into console RAM, where DMA reads it. SNDCORE
     // locks a sound buffer once and transfers from it again and again while the title goes on
