@@ -19,5 +19,6 @@ private:
     // rand's state. COREDLL keeps one per thread; one for the process, as a title that draws
     // from rand on one thread sees the same sequence either way.
     std::uint32_t rand_seed_ = 1;
+    std::uint32_t random_ = 0x2545F491u;  // Random's state (never zero: xorshift)
 };
 }  // namespace dream::wince

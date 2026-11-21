@@ -535,6 +535,15 @@ What took Sega Rally 2 from ARCADE to a race:
 - the compiler's float conversions `_itos` and `_utos` (R4 to FR0) and `_stoi` and `_stou` (FR4
   to R0, truncated, saturating as FTRC does).
 
+Its championship's second stage (the mountain) is the first place it calls the kernel's `Random`
+(rally2.exe+0x678a, `Random() >> 8` added to a value bounded to ±2730): until it was served, a
+game stopped there on the unimplemented import. It returns whole DWORDs, as the documented
+function; the console seeds it from the tick count, dream-wince from a fixed seed (Marsaglia's
+xorshift), so a run is the same each time. What RALLY2.EXE and the modules it loads at start still
+import without a service (`--audit`): `GetAPIAddress` (WDMLIB), `IsBadCodePtr` and `LoadStringW`
+(CEMM), `__C_specific_handler` (only reached when an exception is dispatched), `_purecall` (a
+pure virtual call, a bug) and `_fltused` (data, never called).
+
 Next for speed: the whole title keeps the console's pace in a window, with a tenth to spare in
 the heaviest selection screen, less on a slower host; what is left is the interpreter's dispatch,
 one instruction at a time (the WinCE executables are not statically recompiled), and the AICA's

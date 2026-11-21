@@ -287,6 +287,17 @@ TEST_CASE("WinCE CRT: rand, strings and character conversions as COREDLL's") {
     CHECK(g.call("rand") == 18467);
     g.call("srand", {1});
     CHECK(g.call("rand") == 41);
+    // The kernel's Random: whole DWORDs (Sega Rally 2 shifts them right by 8), the same sequence
+    // in every run, and not rand's.
+    std::uint32_t seen_high = 0, previous = 0;
+    for (int i = 0; i < 16; ++i) {
+        const auto r = g.call("Random");
+        CHECK(r != previous);
+        seen_high |= r & 0xFF000000u;
+        previous = r;
+    }
+    CHECK(seen_high == 0xFF000000u);
+    CHECK(Guest{}.call("Random") == Guest{}.call("Random"));
     g.bytes(0, "DATA\\FMV\\MICRO.SFD");
     g.bytes(40, "FMV");
     CHECK(g.call("strstr", {g.p(0), g.p(40)}) == g.p(5));

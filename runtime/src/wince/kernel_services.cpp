@@ -40,7 +40,7 @@ constexpr std::uint32_t kBase = 0x1F002000, kStringLimit = 1u << 20;
                                                                                         X(_stou)   \
     X(_lshi64) X(_rshi64) X(_rshui64) X(rand) X(srand) X(strstr) X(toupper) X(atol) X(iswctype)    \
         X(_wcsupr) X(mbstowcs) X(wcstombs) X(MultiByteToWideChar) X(swprintf) X(GetLocalTime)      \
-            X(GetSystemTime)
+            X(GetSystemTime) X(Random)
 #define ENUM(name) name,
 enum class Api { WINCE_SERVICES(ENUM) Count };
 #undef ENUM
@@ -767,6 +767,15 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
             // The CRT's generator, as COREDLL's (Worms Armageddon).
             rand_seed_ = rand_seed_ * 214013u + 2531011u;
             result = (rand_seed_ >> 16) & 0x7FFFu;
+            break;
+        case Api::Random:
+            // The kernel's: a random DWORD, all 32 bits (Sega Rally 2's second championship
+            // stage adds Random() >> 8 to a bounded value). The console seeds it from the tick
+            // count; a fixed seed here keeps a run the same each time. Marsaglia's xorshift.
+            random_ ^= random_ << 13;
+            random_ ^= random_ >> 17;
+            random_ ^= random_ << 5;
+            result = random_;
             break;
         case Api::strstr: {
             const auto text = string(memory_, a, false), sought = string(memory_, b, false);
