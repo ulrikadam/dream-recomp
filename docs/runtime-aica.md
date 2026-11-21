@@ -74,10 +74,13 @@ the master volume and 18-bit DAC options. The monitor registers (MSLC-selected E
 with Flycast's LEA-3 clamp) are refreshed on read. Differences from Flycast: the lookup tables are
 generated once by `tools/aica/gen_tables.py` into `mixer_tables.inc` so every host mixes
 bit-identically (ADR 16); no CDDA, MIDI or VMU-beep inputs; the register images are bit-field
-structs on the AICA register bytes.
+structs on the AICA register bytes; the DSP runs a programme only up to its last non-empty step
+(the empty steps after it set nothing read before the next sample: the same output, without
+most of the DSP's time when a title's effects programme is short; 2026-11-21).
 
 Tests (`runtime/tests/test_mixer.cpp`): a keyed-on looping PCM channel plays and releases to
-silence, panning, the noise source, DSP start on a non-empty programme, and determinism.
+silence, panning, the noise source, DSP start on a non-empty programme, the same DSP result with
+empty steps between and after a programme's steps, and determinism.
 
 ## G2 bus DMA (`runtime/holly/g2dma.{h,cpp}`)
 

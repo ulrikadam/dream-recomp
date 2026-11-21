@@ -904,12 +904,16 @@ void Mixer::dsp_step() {
     DspData* dsp = reinterpret_cast<DspData*>(regs_ + 0x3000);
     if (dsp_.dirty) {
         dsp_.dirty = false;
-        dsp_.stopped = true;
-        for (u32 instr : dsp->MPRO)
-            if (instr != 0) {
-                dsp_.stopped = false;
-                break;
-            }
+        // The steps up to the last one with a non-zero word. The empty steps after it only set
+        // X, Y and ACC, which nothing reads before the next sample starts them again at zero:
+        // running them changed nothing, and they were most of the DSP's time.
+        dsp_.steps = 0;
+        for (int step = 0; step < 128; ++step) {
+            const u32* w = dsp->MPRO + step * 4;
+            if (w[0] != 0 || w[1] != 0 || w[2] != 0 || w[3] != 0)
+                dsp_.steps = step + 1;
+        }
+        dsp_.stopped = dsp_.steps == 0;
     }
     if (dsp_.stopped)
         return;
@@ -918,7 +922,7 @@ void Mixer::dsp_step() {
     s32 FRC_REG = 0, Y_REG = 0;
     u32 ADRS_REG = 0;
     DspState& st = dsp_;
-    for (int step = 0; step < 128; ++step) {
+    for (int step = 0; step < st.steps; ++step) {
         const u32* IPtr = dsp->MPRO + step * 4;
         if (IPtr[0] == 0 && IPtr[1] == 0 && IPtr[2] == 0 && IPtr[3] == 0) {
             X = st.TEMP[st.MDEC_CT & 0x7F];

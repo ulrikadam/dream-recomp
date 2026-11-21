@@ -60,6 +60,7 @@ public:
         std::int32_t MIXS[16];   // 20 bits
         std::uint32_t RBP, RBL, MDEC_CT;
         bool stopped, dirty;
+        int steps;  // the program's length: up to its last non-empty step (dsp_step)
     };
 
     struct Channel;  // defined in mixer.cpp

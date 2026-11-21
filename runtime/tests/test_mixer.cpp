@@ -119,6 +119,33 @@ TEST_CASE("mixer: noise source and idle DSP") {
     CHECK(r.aica.mixer.dsp_running());
 }
 
+TEST_CASE("mixer: empty DSP steps change nothing, wherever they are") {
+    // One sound-RAM word read into MEMS[0] (steps 1 and 3), halved (step `at`) and written to
+    // EFREG[0] (step `at` + 1): once with the steps together, once with empty steps between and
+    // after them. dsp_step runs a programme only up to its last non-empty step, so the late
+    // steps must still run, and the result must be the same.
+    auto efreg = [](unsigned at) {
+        Rig r;
+        std::uint8_t* ram = r.sys.memory.aram();
+        ram[2] = 0x00;  // MDEC_CT 1, MADRS[0] 0: the word at byte 2
+        ram[3] = 0x04;  // 0x0400 unpacks to 0x600000
+        auto step = [&](unsigned n, std::uint32_t w0, std::uint32_t w1, std::uint32_t w2) {
+            r.w(0x3400 + 16 * n, w0);
+            r.w(0x3404 + 16 * n, w1);
+            r.w(0x3408 + 16 * n, w2);
+        };
+        step(1, 0, 0, 0x2000);         // MRD
+        step(3, 0, 0x0040, 0);         // IWT: MEMS[0]
+        step(at, 0, 0xA000, 0x0002);   // XSEL, YSEL 1 (COEF), IRA 0, ZERO: ACC = MEMS[0] * Y
+        r.w(0x3000 + 4 * at, 0x4000);  // COEF: Y = 2048, a half
+        step(at + 1, 0, 0, 0x1000);    // EWT: EFREG[0] = previous ACC >> 8
+        r.aica.sample_tick();
+        return r.aica.read(A::kRegBase + 0x4580, 2);
+    };
+    CHECK(efreg(4) == 0x3000u);
+    CHECK(efreg(120) == 0x3000u);
+}
+
 TEST_CASE("mixer: identical inputs give identical output") {
     Rig a, b;
     for (Rig* r : {&a, &b}) {
