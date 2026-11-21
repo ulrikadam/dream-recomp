@@ -7,7 +7,9 @@ hands that to your compiler. The program you end up with contains no SH-4 instru
 This is static recompilation, the approach taken by
 [N64Recomp](https://github.com/Mr-Wiseguy/N64Recomp) and
 [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), aimed at the Dreamcast's SH-4 and at the
-Katana SDK that most Dreamcast games were built with.
+Katana SDK that most Dreamcast games were built with. Games built on Windows CE instead, about a
+tenth of the library, run on `dream-wince`, a Windows CE runtime that runs the disc's own programs
+and drivers on emulated hardware.
 
 You supply the game. Nothing here contains Sega code or data, and none is ever committed. You need
 to dump your own game legally.
@@ -21,32 +23,28 @@ project by phobos665. The fork adds the work below, which has also been offered 
 [#14](https://github.com/phobos665/dream-recomp/issues/14). When those are merged, this fork follows
 upstream again. The licence is unchanged: GPL-2.0.
 
-**Titles tested on Windows 11 with an Xbox pad.** Each game's `[status]` in its `games/<id>/<id>.toml`
-records how far it gets.
+**Nine PAL titles are playable**, tested on Windows 11 with an Xbox pad. Each game's `[status]` in
+its `games/<id>/<id>.toml` records how far it gets.
 
-| Title | Status | Notes |
-|---|---|---|
-| San Francisco Rush 2049 (PAL) | Playable | Menus, memory card, races, sound. |
-| Daytona USA 2001 (PAL) | Playable | Menus, memory card, races, sound. Some grass at the screen edge draws white or black; no shadows yet. |
-| Crazy Taxi 2 (PAL) | Playable | Menus, memory card, missions, sound. No code changes were needed. |
-| Crazy Taxi (PAL) | Playable | Menus, memory card, play, sound. |
-| F355 Challenge (PAL) | Playable | Menus, memory card, races, sound. The save screen's help text overlaps. |
-| Sega GT (PAL) | Playable | Intro movie, menus, a full race. |
-| 18 Wheeler: American Pro Trucker (PAL) | Playable | Menus, truck select, races. |
-| V-Rally 2 Expert Edition (PAL) | Playable | Menus, memory card, races, sound. |
-| Tokyo Highway Challenge (PAL) | Boots | Added by the launcher alone, first try; played once, not yet rated. |
-| Crazy Taxi (USA), Rez, Ikaruga | From upstream | Not re-tested here. |
-| Windows CE titles (Sega Rally 2...) | Unsupported | They boot through IP.BIN and run with the MMU on. |
+| Title | How it runs | Status | Notes |
+|---|---|---|---|
+| San Francisco Rush 2049 (PAL) | Recompiled | Playable | Menus, memory card, races, sound. |
+| Daytona USA 2001 (PAL) | Recompiled | Playable | Menus, memory card, races, sound. Some grass at the screen edge draws white or black; no shadows yet. |
+| Crazy Taxi 2 (PAL) | Recompiled | Playable | Menus, memory card, missions, sound. No code changes were needed. |
+| Crazy Taxi (PAL) | Recompiled | Playable | Menus, memory card, play, sound. |
+| F355 Challenge (PAL) | Recompiled | Playable | Menus, memory card, races, sound. The save screen's help text overlaps. |
+| Sega GT (PAL) | Recompiled | Playable | Intro movie, menus, a full race. |
+| 18 Wheeler: American Pro Trucker (PAL) | Recompiled | Playable | Menus, truck select, races. |
+| V-Rally 2 Expert Edition (PAL) | Recompiled | Playable | Menus, memory card, races, sound. |
+| **Sega Rally 2 (PAL)** | **Windows CE** | **Playable** | Menus, memory card, races at the console's speed, CD music and sound effects. The car and name selection screens run at about 0.8 of the console's speed and stutter. |
+| Worms Armageddon (PAL) | Windows CE | In progress | Starts and loads its first files; its intro movie stays black (its sound does not start yet). |
+| Tokyo Highway Challenge (PAL) | Recompiled | Boots | Added by the launcher alone, first try; played once, not yet rated. |
+| Crazy Taxi (USA), Rez, Ikaruga | Recompiled | From upstream | Not re-tested here. |
 
-Windows CE development now has an [experimental runtime](docs/wince-support.md): a strict SH-4
-memory adapter, a PE32 DLL loader, a COREDLL HLE subset with guest heaps/virtual pages/CRT services,
-recursive critical sections/mutexes and event waits, and guest DirectDraw/Direct3D/DirectSound
-COM interfaces backed by CPU rendering and PCM mixing. `dream-wince` runs original SH-4 PE fixtures,
-captures their graphics/audio, tests synchronization across an original EXE/DLL pair and audits
-real module imports. Commercial CE titles
-remain unsupported; this path does not yet provide a complete Windows CE or DirectX environment.
+**Help is welcome**: see [Help wanted](#help-wanted) for work that is ready to pick up, with where
+to start. Bug reports and title reports are welcome in this fork's issues.
 
-**What the fork adds**
+### What the fork adds
 
 - Translator fixes:
   - a hang on stores near 4 GiB;
@@ -58,7 +56,7 @@ remain unsupported; this path does not yet provide a complete Windows CE or Dire
   - byte switch tables read through `extu.b`.
 - Emulation fixes:
   - HLE fixes for the BIOS checksums Rush 2049 runs, and for GD-ROM PIO reads;
-  - video textures;
+  - video textures, and the YUV converter's end-of-texture interrupt;
   - per-pixel sorting of translucent polygons;
   - double-buffered TA parameter lists, and TA resets that keep what was sent;
   - the interpreter leaving a run entered by a jump at its own return;
@@ -66,11 +64,12 @@ remain unsupported; this path does not yet provide a complete Windows CE or Dire
   - a 64 MB stack for game executables on Windows;
   - polygons reaching far off screen cut to a guard band, and the frame's write clip honoured;
   - textures dropped when the CPU writes over them in video memory.
+- A Windows CE runtime, `dream-wince` ([below](#windows-ce-titles)).
 - A settings screen for the controller and memory cards (F1 in a game).
 - `dream_launcher`: a game library window, in French, with a bar along the bottom of every screen
   (JOUER, AJOUTER UN JEU, CARTES VMU, MANETTE, QUITTER) that the shoulder buttons, Q/W or a click
   move along.
-  - **JOUER** lists your games with their status and starts them.
+  - **JOUER** lists your games with their status and starts them, recompiled or Windows CE.
   - **AJOUTER UN JEU** lists the disc images in your dumps folder, marks those already added, and
     brings a title up alone: it extracts the disc, builds the game, runs it headless to find the
     code discovery missed, folds that into the configuration and builds again
@@ -99,7 +98,66 @@ cmake --build build
 
 On Linux and macOS, `dcdisc` is in `.venv/bin/` instead.
 
-Bug reports and title reports are welcome in this fork's issues.
+## Windows CE titles
+
+Some Dreamcast games were built on Windows CE rather than the Katana SDK: their disc boots
+`0WINCEOS.BIN`, and the game itself is an `.EXE` with `.DLL`s that DirectDraw, DirectSound and
+Sega's own libraries provide. They are not translated. `dream-wince` (in `tools/wince`) loads the
+disc's own executable and DLLs into a process, runs their SH-4 code on the development interpreter
+and answers the operating system's side itself:
+
+- COREDLL in native code: memory, heaps and virtual pages, the C runtime, threads (each guest
+  thread on a host thread of its own, behind a baton, with CE's priorities and quanta),
+  synchronization, files on the disc, the registry, windows and messages, COM classes;
+- the console's hardware emulated underneath: the disc's own DirectDraw, Direct3D and DDHAL drive
+  the PowerVR, its sound driver runs on the ARM7, its Maple driver reads the pad and memory card,
+  the CD audio tracks play from the image;
+- a window that shows the console live and reads the pad, with sound, paced by the sound device.
+
+Sega Rally 2 plays this way, start to finish. To run one by hand:
+
+```bash
+build/tools/wince/dream-wince --run games/<id>/extracted/fs/<GAME>.EXE --lazy --real-directx \
+    --window --disc games/<id>/disc/<id>.gdi --vmu card.bin
+```
+
+The launcher starts a Windows CE title the same way when its `games/<id>/<id>.toml` has a
+`[wince] executable = "extracted/fs/<GAME>.EXE"` table; AJOUTER UN JEU does not write one yet, so
+for now that configuration is written by hand. Everything that went into it, and the bring-up aids
+(`DREAM_WINCE_PROFILE`, `DREAM_WINCE_FRAMES`, `DREAM_WINCE_WAV`, `DREAM_WINCE_STATUS`, traces of the
+Maple bus, the drivers and the interpreter), is in [docs/wince-support.md](docs/wince-support.md).
+The interpreter's speed work is in [docs/runtime-devinterp.md](docs/runtime-devinterp.md#speed-2026-11-10).
+
+## Help wanted
+
+Work that is ready to pick up. Each item says where to start; the docs it points to say what has
+been tried. Open an issue before a large change, so two people do not take the same one.
+
+- **Windows CE speed.** `dream-wince` interprets every instruction (about 60 million a second).
+  Races keep the console's pace, but heavy 3D scenes run at about 0.8 of it: Sega Rally 2's car
+  and name selection screens. Much of that time goes to a few hand-written per-vertex lighting and
+  vertex routines (MGameGL around +0xc580, DDHAL around +0x18480 and +0x13ac0). Options, from
+  smallest to largest: native versions of those routines, checked bit for bit against the
+  interpreter; a block-level interpreter; recompiling the CE modules with the existing translator.
+  `DREAM_WINCE_PROFILE=64` names the hot guest code.
+- **Worms Armageddon.** It reaches its intro movie (CRI Sofdec), which stays black: its sound never
+  starts, and Sofdec times its frames from its ADX sound. With the movies left out it draws its
+  first screens and then writes through a null pointer. Details in
+  [docs/wince-support.md](docs/wince-support.md#worms-armageddon-2026-11-21).
+- **More Windows CE titles.** If you own one, `dream-wince --audit` lists the imports it would
+  miss, and a run with `--lazy` stops at the first one it calls. A report of where it stops is
+  useful on its own.
+- **AJOUTER UN JEU for Windows CE discs.** The launcher refuses them; it could extract them and
+  write the `[wince]` table itself (`launcher/`, `tools/dcdisc`).
+- **Daytona USA 2001**: grass at the screen edge drawn white or black, and shadows. Flycast draws
+  them right, so the bug is ours ([docs/runtime-render.md](docs/runtime-render.md)).
+- **Linux and macOS.** This fork is tested on Windows 11 only; builds and runs elsewhere are
+  welcome, as are fixes.
+- **Title reports.** Any disc you own: how far it gets, with the run's report and, for drawing
+  problems, an `F11` capture (see [When it stops](#when-it-stops)).
+
+Before a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md): no game data, BIOS, saves or SDK
+text in the repository, ever; `clang-format`; tests with every change.
 
 ## Core concepts
 
@@ -146,7 +204,10 @@ globs `games/*` and picks up anything with a `CMakeLists.txt` in it, so adding a
 a directory. A title's target is a no-op for anyone without that title's extracted files, which is
 how the repository can carry configs without carrying games.
 
-## What works today
+## What works upstream
+
+phobos665's own list, as the project stood when this fork was made; this fork's is
+[above](#about-this-fork).
 
 | Title | Translates | Builds | Runs |
 |---|---|---|---|
@@ -208,9 +269,9 @@ build/games/mygame/mygame_boot --config games/mygame/mygame.toml --window
 
 `new-game` reads the name, region, product number and boot filename out of the disc's own IP.BIN
 header, so it picks up the details that are easy to assume wrongly. Charge 'N Blast's boot file is
-`1ST_READ.US`, where most tooling hard-codes `1ST_READ.BIN`. It also refuses Windows CE titles,
-which are out of scope: those games do not use the Katana SDK, and they are about a tenth of the
-library.
+`1ST_READ.US`, where most tooling hard-codes `1ST_READ.BIN`. It also refuses Windows CE titles:
+those games do not use the Katana SDK and are not translated; they run on `dream-wince` instead
+(see [Windows CE titles](#windows-ce-titles)).
 
 ### What it writes
 
@@ -313,7 +374,8 @@ parted.
 - Never paste Sega SDK source or headers into this repository, including into comments. Describe
   the interface in your own words, or point at the equivalent in
   [KallistiOS](https://github.com/KallistiOS/KallistiOS), which is BSD-licensed.
-- Windows CE titles are out of scope.
+- Windows CE titles are not translated: they run on `dream-wince`, and nothing of theirs goes
+  into the emitter.
 - Emitted code must behave identically on x86-64 and ARM64; see ADR 16.
 
 ## Further reading
@@ -321,6 +383,7 @@ parted.
 | Document | What it covers |
 |---|---|
 | [docs/dev-setup.md](docs/dev-setup.md) | Full setup, every launcher flag, the toolchain container |
+| [docs/wince-support.md](docs/wince-support.md) | The Windows CE runtime: what runs, what it took, the bring-up aids |
 | [docs/game-config.md](docs/game-config.md) | The TOML format, relocations, overlays, symbol files |
 | [docs/emitter-design.md](docs/emitter-design.md) | How SH-4 becomes C++: delay slots, FPU modes, interrupts, coverage |
 | [docs/differential-harness.md](docs/differential-harness.md) | Testing against Flycast as an oracle |
