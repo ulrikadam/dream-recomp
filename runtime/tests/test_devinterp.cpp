@@ -207,6 +207,91 @@ TEST_CASE("devinterp: an instruction rewritten after it ran runs as rewritten") 
     sh4::set_hooks(nullptr);
 }
 
+namespace {
+// Guest code read in place (code_span) from one of two buffers for the same addresses; switching
+// buffers bumps the generation, as a memory that moved its code would.
+class MovingCode final : public Memory {
+public:
+    static constexpr std::uint32_t kBase = 0x8C040000u, kSize = 0x100u;
+    std::vector<std::uint8_t> first = std::vector<std::uint8_t>(kSize),
+                              second = std::vector<std::uint8_t>(kSize);
+    std::uint8_t* live = first.data();
+    std::uint64_t generation = 1;
+    void move() {
+        live = second.data();
+        ++generation;
+    }
+    bool code_span(std::uint32_t a, CodeSpan& span) override {
+        if (a - kBase >= kSize)
+            return false;
+        span = {live, kBase, kSize, &generation, generation};
+        return true;
+    }
+    std::uint8_t read8(std::uint32_t a) override { return a - kBase < kSize ? live[a - kBase] : 0; }
+    std::uint16_t read16(std::uint32_t a) override {
+        return static_cast<std::uint16_t>(read8(a) | read8(a + 1) << 8);
+    }
+    std::uint32_t read32(std::uint32_t a) override {
+        return read16(a) | static_cast<std::uint32_t>(read16(a + 2)) << 16;
+    }
+    std::uint64_t read64(std::uint32_t a) override {
+        return read32(a) | static_cast<std::uint64_t>(read32(a + 4)) << 32;
+    }
+    void write8(std::uint32_t a, std::uint8_t v) override {
+        if (a - kBase < kSize)
+            live[a - kBase] = v;
+    }
+    void write16(std::uint32_t a, std::uint16_t v) override {
+        write8(a, static_cast<std::uint8_t>(v));
+        write8(a + 1, static_cast<std::uint8_t>(v >> 8));
+    }
+    void write32(std::uint32_t a, std::uint32_t v) override {
+        write16(a, static_cast<std::uint16_t>(v));
+        write16(a + 2, static_cast<std::uint16_t>(v >> 16));
+    }
+    void write64(std::uint32_t a, std::uint64_t v) override {
+        write32(a, static_cast<std::uint32_t>(v));
+        write32(a + 4, static_cast<std::uint32_t>(v >> 32));
+    }
+    void sq_write32(std::uint32_t, std::uint32_t) override {}
+    void sq_flush(std::uint32_t) override {}
+};
+}  // namespace
+
+TEST_CASE("devinterp: code a service moved is read from where it is now") {
+    // The span's generation is checked after each call out of the interpreter, not on every
+    // instruction: a service that moves the code (as VirtualAlloc or a module load may) must be
+    // seen from the very next instruction.
+    //   sts pr,r2 ; jsr @r1 (the service) ; nop ; lds r2,pr ; add #1,r0 ; rts ; nop
+    // Moved, the add is add #16,r0.
+    sh4::set_hooks(nullptr);
+    MovingCode m;
+    for (auto* code : {&m.first, &m.second}) {
+        const std::uint16_t add = code == &m.first ? 0x7001u : 0x7010u;
+        const std::uint16_t words[] = {0x022Au, 0x410Bu, 0x0009u, 0x422Au, add, 0x000Bu, 0x0009u};
+        for (std::size_t i = 0; i < std::size(words); ++i) {
+            (*code)[2 * i] = static_cast<std::uint8_t>(words[i]);
+            (*code)[2 * i + 1] = static_cast<std::uint8_t>(words[i] >> 8);
+        }
+    }
+    sh4::Ctx c{};
+    c.r[1] = 0x1F000000u;
+    c.pr = 0x8C00FFF0u;
+    c.pc = MovingCode::kBase;
+    devinterp::Options opt;
+    unsigned served = 0;
+    opt.hle_call = [&](sh4::Ctx&, Memory&, std::uint32_t target) {
+        if (target != 0x1F000000u)
+            return false;
+        ++served;
+        m.move();
+        return true;
+    };
+    CHECK(devinterp::run(c, m, 0x8C00FFF0u, opt, nullptr) == devinterp::Stop::Returned);
+    CHECK(served == 1);
+    CHECK(c.r[0] == 16u);  // 1: the old code, read through a stale span
+}
+
 TEST_CASE("devinterp: entered by a jump, an outer RTS elsewhere leaves as a non-local return") {
     // Translated code reached this with a jmp after an earlier call left PR stale, so return_to
     // is not where the code goes back to: its own epilogue pops the real return address. An

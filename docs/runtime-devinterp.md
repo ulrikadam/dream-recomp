@@ -124,8 +124,9 @@ the same frames:
   op, are tables built at first use: the same decoder, so nothing changes but the cost.
 - **code read in place.** `Memory::code_span` hands the interpreter the executable region holding
   PC (host pointer, base, size) with a generation counter the memory bumps whenever such a region
-  may move or go away (`ProcessMemory::forget`). While PC stays in it and the counter has not moved,
-  an instruction is two bytes read from the region, not a virtual `fetch16` and its region lookup;
+  may move or go away (`ProcessMemory::forget`). While PC stays in it and the counter has not moved
+  (checked after each call out of the interpreter since the second round, below), an instruction
+  is two bytes read from the region, not a virtual `fetch16` and its region lookup;
   the last four regions are kept, as calls go back and forth between modules. Reads see stores to
   the same bytes, so code written at run time still runs as written. A memory without spans (the
   default, as `DcMemory`) is fetched through `fetch16` as before.
@@ -139,13 +140,53 @@ the same frames:
 What is left is the dispatch itself (branches the host cannot predict). Going further means
 running blocks of translated code rather than one instruction at a time.
 
+## Speed, second round (2026-11-21)
+
+Sega Rally 2's car and name selection screens ran at about 0.8 of the console's speed: 535
+million instructions every 300 frames, most of them in hand-written vertex transforms and
+per-vertex lighting (MGameGL, DDHAL: `ftrv`, `fipr`, `fmac`, `fcmp/gt`). A bench outside the
+title (DDHAL's clip test loop, 28 instructions a vertex, interpreted over 400,000 vertices in
+RAM with its code read in place) gave 136 million instructions a second, and a three-instruction
+integer loop 188 million: about 20 host cycles an instruction whatever it does. The sampling
+profiler put a fifth of it on two host instructions of the loop, and those were not cache misses
+(the bench, whose loop fits in the cache, showed them too). What changed, with the bench's figures
+for the clip loop and the integer loop:
+
+- **one look-up for what run() does with an instruction** (`Kind`: plain, BT/BF, delayed), by op,
+  instead of the delay-slot table and two compares; **the trace tests folded** into one flag set
+  when either trace is asked for; **`pcrel_target` inline** (`word_target`, `long_target`: it was a
+  call into the translator library for every PC-relative load and branch); **the floating-point
+  cases in `exec`'s switch** rather than a second function and switch. 136 → 164, 188 → 200.
+- **the decoded instruction used in place.** `fetch` returned a copy of the 16-byte entry; the
+  copy went through the stack and the opcode was read back from it at once, a store-forwarding
+  stall on every instruction. It returns a reference to the entry now, which only a later fetch
+  of the same address with another word can change (the delayed path keeps the branch's opcode
+  in a local, as what follows the slot may run guest code that fetches again). 164 → 175, 200 →
+  237.
+- **`exec` inlined into the loop** (`DREAM_INTERP_INLINE`): as a call, saving and restoring six
+  registers around each instruction cost a third of the floating-point loop's time. 175 → 232,
+  237 → 266.
+- **the span checked where it can change.** A span (`Memory::code_span`) is only moved or freed
+  by the memory's own calls (`ProcessMemory::forget`: allocation, release, protection, windows),
+  which only services reach. The interpreter keeps the span as a base, a pointer and a room (one
+  compare per instruction) and checks its generation after each call out (`Machine::recheck`:
+  services, translated code, the poll, `on_return`, `rte`, TRAPA, SLEEP, LDTLB) instead of on
+  every instruction. 266 → 315 on the integer loop, the clip loop unchanged within noise.
+
+In the title, with the store-queue and DSP changes of [the CE runtime](wince-support.md)
+(Speed, second round), the selection's heaviest 600 frames went from 11.8 to 8.9 seconds without a
+window (10 on the console), the race's 300 frames from about 3.7 to 3.0, with the same renders in
+the same frames; in a window every 300 frames keep the console's 5.0 seconds with time to spare
+and the sound never runs dry.
+
 ## Tests
 
 - `runtime/tests/test_devinterp.cpp`: an untranslated callee (hand-assembled in RAM, with a
   delay-slot instruction) returning to a translated caller; interpreted code calling a translated
   function natively and resuming; an untranslated interrupt handler running in register bank 1 and
   unwinding through `rte`; the step limit; an instruction rewritten after it ran, which must run as
-  rewritten. In the release configuration the same file checks that
+  rewritten; code a service moved (a new span, a new generation), which must be read from where
+  it is now from the next instruction on. In the release configuration the same file checks that
   the miss is recorded and throws.
 - `tests/sh4/test_golden.cpp`: every golden (p1–p7, the GCC C unit, the Crazy Taxi slice) replays in
   three modes, translated, interpreted, and hybrid (calls into translated code made natively), and

@@ -19,8 +19,10 @@
 
 #if defined(_MSC_VER)
 #define DREAM_INTERP_NOINLINE __declspec(noinline)
+#define DREAM_INTERP_INLINE __forceinline
 #else
 #define DREAM_INTERP_NOINLINE __attribute__((noinline))
+#define DREAM_INTERP_INLINE inline __attribute__((always_inline))
 #endif
 
 namespace dream::devinterp {
@@ -75,22 +77,44 @@ const TraceAt& trace_at() {
 std::uint64_t trace_left = 0;  // instructions still to print after TRACE_AT's pc was reached
 bool trace_fired = false;      // it was: once only
 
+// How run() treats an instruction, by Op: one look-up instead of three tests per instruction.
+enum class Kind : std::uint8_t {
+    Plain,        // exec()
+    Conditional,  // BT, BF: no delay slot, handled by run()
+    Delayed,      // sh4::has_delay_slot: run() executes the slot, then transfers
+};
+
 // sh4::decode of every instruction word, done once: decoding each executed instruction again was
 // a sixth of the interpreter's time. Same decoder, so nothing changes but the cost.
 struct Decoded {
     std::array<Instr, 0x10000> ins;
-    std::array<bool, 256> delayed;  // sh4::has_delay_slot, by Op
+    std::array<Kind, 256> kind;
 };
 const Decoded& decoded() {
     static const Decoded* const table = [] {
         auto* t = new Decoded;
         for (std::uint32_t w = 0; w < 0x10000; ++w)
             t->ins[w] = sh4::decode(static_cast<std::uint16_t>(w));
-        for (unsigned op = 0; op < 256; ++op)
-            t->delayed[op] = sh4::has_delay_slot(static_cast<Op>(op));
+        for (unsigned op = 0; op < 256; ++op) {
+            const auto o = static_cast<Op>(op);
+            t->kind[op] = sh4::has_delay_slot(o)       ? Kind::Delayed
+                          : o == Op::BT || o == Op::BF ? Kind::Conditional
+                                                       : Kind::Plain;
+        }
         return t;
     }();
     return *table;
+}
+
+// sh4::pcrel_target's two forms, inline: it is a call into the translator library otherwise, made
+// for every PC-relative load and branch. Keep them in step with it.
+// Branches (BT, BF, BT/S, BF/S, BRA, BSR) and MOV.W @(disp,PC).
+DREAM_INTERP_INLINE std::uint32_t word_target(const Instr& ins, std::uint32_t pc) noexcept {
+    return pc + 4 + static_cast<std::uint32_t>(ins.imm) * 2;
+}
+// MOV.L @(disp,PC) and MOVA.
+DREAM_INTERP_INLINE std::uint32_t long_target(const Instr& ins, std::uint32_t pc) noexcept {
+    return (pc & ~3u) + 4 + static_cast<std::uint32_t>(ins.imm) * 4;
 }
 
 // The decoded instructions of a 4 KiB page of guest code, in program order. Looking each one up
@@ -126,6 +150,8 @@ struct Machine {
     const Decoded& dec = decoded();
     const std::uint64_t trace = trace_budget();
     std::uint32_t trace_pc = trace_fired ? 1u : trace_at().pc;
+    // Either trace is asked for: the one test fetch() makes when neither is.
+    const bool tracing = trace != 0 || trace_at().pc != 1;
     // The code being run, read in place while it stays valid (Memory::code_span); without one,
     // each instruction goes through fetch16.
     ::dream::CodeSpan span{};
@@ -133,19 +159,38 @@ struct Machine {
     std::array<::dream::CodeSpan, 4> recent{};
     unsigned next_recent = 0;
     bool spans = true;
+    // `span` as word() reads it: a whole instruction word is at `code + (pc - code_base)` for
+    // any pc with pc - code_base < code_room; no room, no span. Only the memory's own calls move
+    // or free a span (VirtualAlloc and the like, from a service), so its generation is checked
+    // after each call out of the interpreter (recheck), not on every instruction.
+    const std::uint8_t* code = nullptr;
+    std::uint32_t code_base = 0, code_room = 0;
 
-    bool delayed(Op op) const { return dec.delayed[static_cast<std::uint8_t>(op)]; }
+    Kind kind(Op op) const { return dec.kind[static_cast<std::uint8_t>(op)]; }
 
     static bool holds(const ::dream::CodeSpan& s, std::uint32_t pc) {
         const std::uint32_t offset = pc - s.base;
         return s.generation && *s.generation == s.at && offset < s.size && s.size - offset >= 2;
     }
 
+    void use_span() {
+        code = span.bytes;
+        code_base = span.base;
+        code_room = span.generation && span.size >= 2 ? span.size - 1 : 0;
+    }
+
+    // After anything that may have run other code (a service, a callback, an interrupt, another
+    // thread): the span is dropped if the memory moved it, and found again on the next fetch.
+    void recheck() {
+        if (code_room && *span.generation != span.at)
+            code_room = 0;
+    }
+
     std::uint16_t word(std::uint32_t pc) {
-        if (!holds(span, pc))
+        if (pc - code_base >= code_room)
             return word_elsewhere(pc);
         std::uint16_t w;
-        std::memcpy(&w, span.bytes + (pc - span.base), 2);  // little-endian, as the guest
+        std::memcpy(&w, code + (pc - code_base), 2);  // little-endian, as the guest
         return w;
     }
 
@@ -164,10 +209,12 @@ struct Machine {
             recent[next_recent++ % recent.size()] = span;
             if (!m.code_span(pc, span) || !holds(span, pc)) {
                 span = {};
+                use_span();
                 spans = false;  // none here: fetch16 for the rest of this run
                 return m.fetch16(pc);
             }
         }
+        use_span();
         std::uint16_t w;
         std::memcpy(&w, span.bytes + (pc - span.base), 2);
         return w;
@@ -190,14 +237,22 @@ struct Machine {
         page_base = base;
     }
 
-    Instr fetch(std::uint32_t pc) {
+    // The decoded instruction, in place in its page: a copy went through the stack, and reading
+    // its opcode back from a 16-byte store stalled each instruction (a fifth of the interpreter's
+    // time). The entry only changes when a later fetch of the same address finds another word.
+    const Instr& fetch(std::uint32_t pc) {
         const std::uint16_t w = word(pc);
         if ((pc & ~0xFFFu) != page_base)
             enter_page(pc & ~0xFFFu);
         Instr& entry = page->ins[(pc & 0xFFF) >> 1];
         if (entry.raw != w)
             entry = dec.ins[w];
-        const Instr ins = entry;
+        if (tracing)
+            trace_step(pc, entry);
+        return entry;
+    }
+
+    DREAM_INTERP_NOINLINE void trace_step(std::uint32_t pc, const Instr& ins) {
         if (pc == trace_pc && trace_pc != 1) {
             trace_left = trace_at().count;
             trace_pc = 1;  // once
@@ -209,165 +264,19 @@ struct Machine {
                          "ssr=%08x\n",
                          pc, ins.raw, sh4::format(ins, pc).c_str(), c.r[0], c.r[15], c.pr,
                          sh4::read_sr(c), c.spc, c.ssr);
-        return ins;
     }
 
     void poll() {
-        if (c.cycles >= c.next_event)
+        if (c.cycles >= c.next_event) {
             sh4::deliver_irq(c, m);
-    }
-
-    // ---- FPU: the mode is read from FPSCR at run time (the emitter resolves it statically) ----
-    void exec_fp(std::uint32_t pc, const Instr& ins) {
-        using namespace sh4;
-        const unsigned n = ins.n, mm = ins.m;
-        const bool pr = (c.fpscr & FPSCR_PR) != 0, sz = (c.fpscr & FPSCR_SZ) != 0;
-        float& frn = c.fr[n];
-        float& frm = c.fr[mm];
-        const unsigned dn = n & ~1u, dm = mm & ~1u;
-        std::uint32_t& rn = c.r[n];
-        std::uint32_t& rm = c.r[mm];
-        const std::uint32_t r0 = c.r[0];
-        switch (ins.op) {
-            case Op::FLDI0:
-                frn = 0.0f;
-                break;
-            case Op::FLDI1:
-                frn = 1.0f;
-                break;
-            case Op::FLDS:
-                c.fpul = f2u(frn);
-                break;
-            case Op::FSTS:
-                frn = u2f(c.fpul);
-                break;
-            case Op::FABS:
-                frn = u2f(f2u(frn) & 0x7fffffffu);
-                break;
-            case Op::FNEG:
-                frn = u2f(f2u(frn) ^ 0x80000000u);
-                break;
-            case Op::FADD:
-                if (pr)
-                    set_dr(c, dn, get_dr(c, dn) + get_dr(c, dm));
-                else
-                    frn += frm;
-                break;
-            case Op::FSUB:
-                if (pr)
-                    set_dr(c, dn, get_dr(c, dn) - get_dr(c, dm));
-                else
-                    frn -= frm;
-                break;
-            case Op::FMUL:
-                if (pr)
-                    set_dr(c, dn, get_dr(c, dn) * get_dr(c, dm));
-                else
-                    frn *= frm;
-                break;
-            case Op::FDIV:
-                if (pr)
-                    set_dr(c, dn, get_dr(c, dn) / get_dr(c, dm));
-                else
-                    frn /= frm;
-                break;
-            case Op::FCMP_EQ:
-                c.t = pr ? (get_dr(c, dn) == get_dr(c, dm)) : (frn == frm);
-                break;
-            case Op::FCMP_GT:
-                c.t = pr ? (get_dr(c, dn) > get_dr(c, dm)) : (frn > frm);
-                break;
-            case Op::FMAC:
-                frn = fmac(c.fr[0], frm, frn);
-                break;
-            case Op::FLOAT:
-                if (pr)
-                    set_dr(c, dn, static_cast<double>(static_cast<std::int32_t>(c.fpul)));
-                else
-                    frn = static_cast<float>(static_cast<std::int32_t>(c.fpul));
-                break;
-            case Op::FTRC:
-                c.fpul = pr ? ftrc(get_dr(c, dn)) : ftrc(frn);
-                break;
-            case Op::FSQRT:
-                if (pr)
-                    set_dr(c, dn, std::sqrt(get_dr(c, dn)));
-                else
-                    frn = std::sqrt(frn);
-                break;
-            case Op::FSRRA:
-                frn = 1.0f / std::sqrt(frn);
-                break;
-            case Op::FCNVSD:
-                set_dr(c, dn, static_cast<double>(u2f(c.fpul)));
-                break;
-            case Op::FCNVDS:
-                c.fpul = f2u(static_cast<float>(get_dr(c, dn)));
-                break;
-            case Op::FSCA:
-                fsca(c, dn);
-                break;
-            case Op::FIPR:
-                fipr(c, mm, n);
-                break;
-            case Op::FTRV:
-                ftrv(c, n);
-                break;
-            case Op::FMOV:
-                if (sz)
-                    fmov_pair_load(c, n, fmov_pair_store(c, mm));
-                else
-                    frn = frm;
-                break;
-            case Op::FMOV_LOAD:
-                if (sz)
-                    fmov_pair_load(c, n, read_pair(m, rm));
-                else
-                    frn = u2f(m.read32(rm));
-                break;
-            case Op::FMOV_LOAD_INC:
-                if (sz) {
-                    fmov_pair_load(c, n, read_pair(m, rm));
-                    rm += 8;
-                } else {
-                    frn = u2f(m.read32(rm));
-                    rm += 4;
-                }
-                break;
-            case Op::FMOV_LOAD_R0:
-                if (sz)
-                    fmov_pair_load(c, n, read_pair(m, rm + r0));
-                else
-                    frn = u2f(m.read32(rm + r0));
-                break;
-            case Op::FMOV_STORE:
-                if (sz)
-                    write_pair(m, rn, fmov_pair_store(c, mm));
-                else
-                    m.write32(rn, f2u(frm));
-                break;
-            case Op::FMOV_STORE_DEC:
-                if (sz) {
-                    rn -= 8;
-                    write_pair(m, rn, fmov_pair_store(c, mm));
-                } else {
-                    rn -= 4;
-                    m.write32(rn, f2u(frm));
-                }
-                break;
-            case Op::FMOV_STORE_R0:
-                if (sz)
-                    write_pair(m, rn + r0, fmov_pair_store(c, mm));
-                else
-                    m.write32(rn + r0, f2u(frm));
-                break;
-            default:
-                sh4::unimplemented(c, ins.raw, pc);
+            recheck();
         }
     }
 
     // ---- everything that is not a delayed branch (BT/BF are handled by the caller) ----
-    void exec(std::uint32_t pc, const Instr& ins) {
+    // Inlined into run()'s loop: as a call, its entry and exit (six registers saved and restored)
+    // cost a third of the time of floating-point code.
+    DREAM_INTERP_INLINE void exec(std::uint32_t pc, const Instr& ins) {
         using namespace sh4;
         const unsigned n = ins.n, mm = ins.m;
         const std::int32_t imm = ins.imm;
@@ -376,6 +285,11 @@ struct Machine {
         std::uint32_t& r0 = c.r[0];
         const std::uint32_t d = u32(imm), d2 = u32(imm * 2), d4 = u32(imm * 4);
         std::uint32_t& bank = c.r_bank[ins.bank];
+        float& frn = c.fr[n];
+        float& frm = c.fr[mm];
+        const unsigned dn = n & ~1u, dm = mm & ~1u;
+        const auto pr = [this] { return (c.fpscr & FPSCR_PR) != 0; };
+        const auto sz = [this] { return (c.fpscr & FPSCR_SZ) != 0; };
         switch (ins.op) {
             // moves and loads/stores
             case Op::MOV_I:
@@ -385,13 +299,13 @@ struct Machine {
                 rn = rm;
                 break;
             case Op::MOV_W_PCREL:
-                rn = sx16(m.read16(pcrel_target(ins, pc)));
+                rn = sx16(m.read16(word_target(ins, pc)));
                 break;
             case Op::MOV_L_PCREL:
-                rn = m.read32(pcrel_target(ins, pc));
+                rn = m.read32(long_target(ins, pc));
                 break;
             case Op::MOVA:
-                r0 = pcrel_target(ins, pc);
+                r0 = long_target(ins, pc);
                 break;
             case Op::MOVT:
                 rn = c.t;
@@ -900,6 +814,7 @@ struct Machine {
             case Op::TRAPA:
                 c.pc = pc;
                 sh4::trapa(c, m, d);
+                recheck();
                 break;
             case Op::MOVCA_L:
                 m.write32(rn, r0);
@@ -910,6 +825,7 @@ struct Machine {
                 break;
             case Op::LDTLB:
                 m.ldtlb();
+                recheck();
                 break;
             case Op::OCBI:
             case Op::OCBP:
@@ -923,6 +839,7 @@ struct Machine {
                 if (c.next_event > c.cycles)
                     c.cycles = c.next_event;
                 sh4::deliver_irq(c, m);
+                recheck();
                 break;
 
             // FPU control
@@ -961,36 +878,139 @@ struct Machine {
                 rm += 4;
                 break;
 
+            // ---- FPU: the mode is read from FPSCR at run time (the emitter resolves it
+            // statically). In this switch rather than a second one: one dispatch each.
             case Op::FLDI0:
+                frn = 0.0f;
+                break;
             case Op::FLDI1:
+                frn = 1.0f;
+                break;
             case Op::FLDS:
+                c.fpul = f2u(frn);
+                break;
             case Op::FSTS:
+                frn = u2f(c.fpul);
+                break;
             case Op::FABS:
+                frn = u2f(f2u(frn) & 0x7fffffffu);
+                break;
             case Op::FNEG:
+                frn = u2f(f2u(frn) ^ 0x80000000u);
+                break;
             case Op::FADD:
+                if (pr())
+                    set_dr(c, dn, get_dr(c, dn) + get_dr(c, dm));
+                else
+                    frn += frm;
+                break;
             case Op::FSUB:
+                if (pr())
+                    set_dr(c, dn, get_dr(c, dn) - get_dr(c, dm));
+                else
+                    frn -= frm;
+                break;
             case Op::FMUL:
+                if (pr())
+                    set_dr(c, dn, get_dr(c, dn) * get_dr(c, dm));
+                else
+                    frn *= frm;
+                break;
             case Op::FDIV:
+                if (pr())
+                    set_dr(c, dn, get_dr(c, dn) / get_dr(c, dm));
+                else
+                    frn /= frm;
+                break;
             case Op::FCMP_EQ:
+                c.t = pr() ? (get_dr(c, dn) == get_dr(c, dm)) : (frn == frm);
+                break;
             case Op::FCMP_GT:
+                c.t = pr() ? (get_dr(c, dn) > get_dr(c, dm)) : (frn > frm);
+                break;
             case Op::FMAC:
+                frn = fmac(c.fr[0], frm, frn);
+                break;
             case Op::FLOAT:
+                if (pr())
+                    set_dr(c, dn, static_cast<double>(static_cast<std::int32_t>(c.fpul)));
+                else
+                    frn = static_cast<float>(static_cast<std::int32_t>(c.fpul));
+                break;
             case Op::FTRC:
+                c.fpul = pr() ? ftrc(get_dr(c, dn)) : ftrc(frn);
+                break;
             case Op::FSQRT:
+                if (pr())
+                    set_dr(c, dn, std::sqrt(get_dr(c, dn)));
+                else
+                    frn = std::sqrt(frn);
+                break;
             case Op::FSRRA:
+                frn = 1.0f / std::sqrt(frn);
+                break;
             case Op::FCNVSD:
+                set_dr(c, dn, static_cast<double>(u2f(c.fpul)));
+                break;
             case Op::FCNVDS:
+                c.fpul = f2u(static_cast<float>(get_dr(c, dn)));
+                break;
             case Op::FSCA:
+                fsca(c, dn);
+                break;
             case Op::FIPR:
+                fipr(c, mm, n);
+                break;
             case Op::FTRV:
+                ftrv(c, n);
+                break;
             case Op::FMOV:
+                if (sz())
+                    fmov_pair_load(c, n, fmov_pair_store(c, mm));
+                else
+                    frn = frm;
+                break;
             case Op::FMOV_LOAD:
+                if (sz())
+                    fmov_pair_load(c, n, read_pair(m, rm));
+                else
+                    frn = u2f(m.read32(rm));
+                break;
             case Op::FMOV_LOAD_INC:
+                if (sz()) {
+                    fmov_pair_load(c, n, read_pair(m, rm));
+                    rm += 8;
+                } else {
+                    frn = u2f(m.read32(rm));
+                    rm += 4;
+                }
+                break;
             case Op::FMOV_LOAD_R0:
+                if (sz())
+                    fmov_pair_load(c, n, read_pair(m, rm + r0));
+                else
+                    frn = u2f(m.read32(rm + r0));
+                break;
             case Op::FMOV_STORE:
+                if (sz())
+                    write_pair(m, rn, fmov_pair_store(c, mm));
+                else
+                    m.write32(rn, f2u(frm));
+                break;
             case Op::FMOV_STORE_DEC:
+                if (sz()) {
+                    rn -= 8;
+                    write_pair(m, rn, fmov_pair_store(c, mm));
+                } else {
+                    rn -= 4;
+                    m.write32(rn, f2u(frm));
+                }
+                break;
             case Op::FMOV_STORE_R0:
-                exec_fp(pc, ins);
+                if (sz())
+                    write_pair(m, rn + r0, fmov_pair_store(c, mm));
+                else
+                    m.write32(rn + r0, f2u(frm));
                 break;
 
             default:
@@ -1013,13 +1033,21 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
     auto native = [&](sh4::GuestFn fn) -> bool {
         try {
             fn(c, m);
+            mc.recheck();
             return false;
         } catch (const sh4::NonLocalReturn& n) {
             if (!opt.catch_nonlocal)
                 throw;
+            mc.recheck();
             c.pc = n.pc;
             return true;
         }
+    };
+    // A service the embedder serves (Options::hle_call), and the span check after it.
+    auto hle = [&](std::uint32_t target) -> bool {
+        const bool served = opt.hle_call(c, m, target);
+        mc.recheck();
+        return served;
     };
     unsigned depth = 0;  // interpreted calls not yet returned from, for leave_on_outer_return
     const std::uint64_t limit = opt.max_instructions ? opt.max_instructions : ~std::uint64_t{0};
@@ -1027,50 +1055,53 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
         if (st.instructions >= limit)
             return Stop::StepLimit;
         const std::uint32_t pc = c.pc;
-        const Instr ins = mc.fetch(pc);
+        const Instr& ins = mc.fetch(pc);
         ++st.instructions;
         c.cycles += 1;
 
-        if (!mc.delayed(ins.op)) {
-            if (ins.op == Op::BT || ins.op == Op::BF) {
-                const std::uint32_t t = sh4::pcrel_target(ins, pc);
-                const bool taken = ins.op == Op::BT ? c.t != 0 : c.t == 0;
-                if (!taken) {
-                    c.pc = pc + 2;
-                    continue;
-                }
-                c.cycles += 1;
-                if (t == return_to)
-                    return Stop::Returned;
-                c.pc = t;
-                if (t <= pc)
-                    mc.poll();
-                continue;
-            }
+        const Kind kind = mc.kind(ins.op);
+        if (kind == Kind::Plain) {
             mc.exec(pc, ins);
             c.pc = pc + 2;
+            continue;
+        }
+        if (kind == Kind::Conditional) {  // BT, BF
+            const std::uint32_t t = word_target(ins, pc);
+            const bool taken = ins.op == Op::BT ? c.t != 0 : c.t == 0;
+            if (!taken) {
+                c.pc = pc + 2;
+                continue;
+            }
+            c.cycles += 1;
+            if (t == return_to)
+                return Stop::Returned;
+            c.pc = t;
+            if (t <= pc)
+                mc.poll();
             continue;
         }
 
         // Delayed branch: the branch's operands are read before the slot runs (target, condition,
         // PR for calls), the slot executes at pc+2, then control transfers. Mirrors emit_delayed().
-        const Instr slot = mc.fetch(pc + 2);
+        const Instr& slot = mc.fetch(pc + 2);
+        // The branch's opcode, kept: what runs below (a service, a callback) may fetch again.
+        const Op op = ins.op;
         ++st.instructions;
         c.cycles += 1;
         enum class Flow { Jump, Call, Ret, Rte } flow = Flow::Jump;
         std::uint32_t t = 0;
         bool taken = true;
-        switch (ins.op) {
+        switch (op) {
             case Op::BT_S:
                 taken = c.t != 0;
-                t = sh4::pcrel_target(ins, pc);
+                t = word_target(ins, pc);
                 break;
             case Op::BF_S:
                 taken = c.t == 0;
-                t = sh4::pcrel_target(ins, pc);
+                t = word_target(ins, pc);
                 break;
             case Op::BRA:
-                t = sh4::pcrel_target(ins, pc);
+                t = word_target(ins, pc);
                 break;
             case Op::BRAF:
                 t = pc + 4 + c.r[ins.m];
@@ -1079,7 +1110,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 t = c.r[ins.m];
                 break;
             case Op::BSR:
-                t = sh4::pcrel_target(ins, pc);
+                t = word_target(ins, pc);
                 c.pr = pc + 4;
                 flow = Flow::Call;
                 break;
@@ -1103,7 +1134,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
             default:
                 sh4::unimplemented(c, ins.raw, pc);
         }
-        if (mc.delayed(slot.op) || slot.op == Op::BT || slot.op == Op::BF)
+        if (mc.kind(slot.op) != Kind::Plain)
             sh4::unimplemented(c, slot.raw, pc + 2);  // illegal slot instruction, as the emitter
         mc.exec(pc + 2, slot);
 
@@ -1115,6 +1146,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
             c.pc = pc;
             if (sh4::rte(c, m))
                 return Stop::Rte;
+            mc.recheck();
             t = c.pc;
             flow = Flow::Jump;
         }
@@ -1129,12 +1161,13 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 // An RTE used as a jump is not a return through PR: it goes to SPC even when SPC
                 // happens to equal the caller's return address (both zero in an uninitialised
                 // context, where "returning" would hide the real fault of executing address 0).
-                if (t == return_to && ins.op != Op::RTE)
+                if (t == return_to && op != Op::RTE)
                     return Stop::Returned;
-                const bool computed = ins.op == Op::JMP || ins.op == Op::BRAF || ins.op == Op::RTE;
-                if (computed && ins.op != Op::RTE && opt.hle_call && opt.hle_call(c, m, t)) {
+                const bool computed = op == Op::JMP || op == Op::BRAF || op == Op::RTE;
+                if (computed && op != Op::RTE && opt.hle_call && hle(t)) {
                     ++st.native_calls;
-                    if (c.pr == return_to) return Stop::Returned;
+                    if (c.pr == return_to)
+                        return Stop::Returned;
                     c.pc = c.pr;
                     mc.poll();
                     break;
@@ -1162,7 +1195,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 break;
             }
             case Flow::Call:
-                if (opt.hle_call && opt.hle_call(c, m, t)) {
+                if (opt.hle_call && hle(t)) {
                     ++st.native_calls;
                     c.pc = pc + 4;
                     mc.poll();
@@ -1186,6 +1219,7 @@ Stop run(Ctx& c, ::dream::Memory& m, std::uint32_t return_to, const Options& opt
                 if (opt.on_return) {
                     c.pc = pc;  // the RTS, should the hook look
                     opt.on_return(c, t);
+                    mc.recheck();
                 }
                 if (opt.leave_on_outer_return) {
                     if (depth == 0) {
