@@ -3,6 +3,8 @@
 #include <cstring>
 
 #include "dream/runtime/wince/dc_hardware.h"
+#include "dream/runtime/wince/process.h"
+#include "dream/runtime/wince/system_services.h"
 
 #include "doctest.h"
 
@@ -34,4 +36,42 @@ TEST_CASE("wince hardware: the whole store-queue area follows SetStoreQueueBase"
     CHECK(ram_word(hw, 0xF0003C) == 0x207);
     CHECK(hw.system().memory.sq_tlb_flushes == 2);
     CHECK(hw.system().memory.sq_tlb_misses == 0);
+}
+
+TEST_CASE("wince hardware: locked pages follow the process memory they copy") {
+    // MmProbeAndLockPages copies process memory into console RAM, where DMA reads it. SNDCORE
+    // locks a sound buffer once and transfers from it again and again while the title goes on
+    // writing it: the copy must take the bytes as they are at each transfer (and give back what
+    // a transfer into RAM wrote), or Sega Rally 2's sound went out as silence.
+    DcHardware hw([] { return std::uint64_t{0}; });
+    dream::wince::ProcessMemory memory;
+    memory.set_hardware(&hw);
+    dream::wince::SystemServices services(memory);
+    const auto buffer = memory.allocate(8192), mdl = memory.allocate(256);
+    REQUIRE(buffer != 0);
+    REQUIRE(mdl != 0);
+    const std::uint32_t at = buffer + 0x10, count = 64;
+    memory.write32(mdl + 12, at & ~0xFFFu);  // StartVa
+    memory.write32(mdl + 16, count);         // ByteCount
+    memory.write32(mdl + 20, at & 0xFFFu);   // ByteOffset
+    for (std::uint32_t i = 0; i < count; i += 4) memory.write32(at + i, 0x11110000u + i);
+    dream::sh4::Ctx cpu{};
+    cpu.r[4] = mdl;
+    std::uint32_t error = 0;
+    REQUIRE(services.invoke(cpu, memory,
+                            *dream::wince::SystemServices::resolve("MmProbeAndLockPages"), error));
+    const std::uint32_t physical = (memory.read32(mdl + 24) << 12) + (at & 0xFFFu);
+    CHECK(ram_word(hw, physical - 0x0C000000u) == 0x11110000u);  // copied at the lock
+    for (std::uint32_t i = 0; i < count; i += 4) memory.write32(at + i, 0x22220000u + i);
+    CHECK(ram_word(hw, physical - 0x0C000000u) == 0x11110000u);  // not yet
+    services.sync_locked(physical + 8, 8, true);                 // a DMA reads two words
+    CHECK(ram_word(hw, physical - 0x0C000000u + 8) == 0x22220008u);
+    CHECK(ram_word(hw, physical - 0x0C000000u + 12) == 0x2222000Cu);
+    CHECK(ram_word(hw, physical - 0x0C000000u + 16) == 0x11110010u);  // outside it: untouched
+    std::uint32_t word = 0x33330000u;
+    std::memcpy(hw.system().memory.ram() + (physical - 0x0C000000u + 20), &word, 4);
+    services.sync_locked(physical + 20, 4, false);  // a DMA wrote one
+    CHECK(memory.read32(at + 20) == 0x33330000u);
+    services.sync_locked(0x0C000000u, 16, true);  // elsewhere in RAM: nothing locked there
+    CHECK(memory.read32(at) == 0x22220000u);
 }

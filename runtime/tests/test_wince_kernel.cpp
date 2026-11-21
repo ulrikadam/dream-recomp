@@ -224,8 +224,9 @@ TEST_CASE("WinCE CD-ROM device: the high-density table of contents, answered at 
     // Play, pause, resume, stop and volume reach the sound output, addresses as FADs.
     struct Heard : CdAudioOutput {
         std::vector<std::string> calls;
-        void play(std::uint32_t start, std::uint32_t end) override {
-            calls.push_back("play " + std::to_string(start) + " " + std::to_string(end));
+        void play(std::uint32_t start, std::uint32_t end, unsigned repeats) override {
+            calls.push_back("play " + std::to_string(start) + " " + std::to_string(end) + " " +
+                            std::to_string(repeats));
         }
         void stop() override { calls.push_back("stop"); }
         void pause() override { calls.push_back("pause"); }
@@ -245,13 +246,146 @@ TEST_CASE("WinCE CD-ROM device: the high-density table of contents, answered at 
     CHECK(g.call("DeviceIoControl", {device, 0x24010, 0, 0, 0, 0, g.p(96), 0}) == 1);
     CHECK(g.call("DeviceIoControl", {device, 0x24028, g.p(210), 4, 0, 0, g.p(96), 0}) == 1);
     CHECK(g.call("DeviceIoControl", {device, 0x24008, 0, 0, 0, 0, g.p(96), 0}) == 1);
-    CHECK(heard.calls == std::vector<std::string>{"play 124018 124500", "pause", "resume",
-                                                  "volume 128 64", "stop"});
+    // The Dreamcast driver's play by tracks: {first, last, repeats}, to the lead-out here.
+    const std::uint32_t tracks[3] = {4, 4, 15};
+    for (unsigned i = 0; i < 3; ++i) g.m.write32(g.p(220 + i * 4), tracks[i]);
+    CHECK(g.call("DeviceIoControl", {device, 0x25020, g.p(220), 12, 0, 0, g.p(96), 0}) == 1);
+    CHECK(g.call("DeviceIoControl", {device, 0x25040, g.p(210), 4, 0, 0, g.p(96), 0}) == 1);
+    CHECK(heard.calls == std::vector<std::string>{"play 124018 124500 0", "pause", "resume",
+                                                  "volume 128 64", "stop",
+                                                  "play 124018 150150 15"});
     // A short request is refused.
     CHECK(g.call("DeviceIoControl", {device, 0x24018, g.p(200), 3, 0, 0, g.p(96), 0}) == 0);
     CHECK(g.call("DeviceIoControl", {device, 0x24014, 0, 0, g.p(301), 4, g.p(96), 0}) == 1);
     CHECK(g.m.read8(g.p(301)) == 0x80);
     g.kernel.system_services()->set_cd_audio(nullptr);
+}
+
+TEST_CASE("WinCE interrupts: an IST is signalled a while after its interrupt, not at once") {
+    // SNDCORE's IST writes the sound driver's next command where the driver still clears the
+    // last one for a few ARM instructions after raising the interrupt: at once, the command was
+    // lost and Sega Rally 2's sound stalled.
+    Guest g;
+    const auto event = g.call("CreateEventW", {0, 0, 0, 0});
+    REQUIRE(g.call("InterruptInitialize", {23, event, 0, 0}) == 1);
+    auto* system = g.kernel.system_services();
+    constexpr auto latency = SystemServices::kIstLatency;
+    CHECK(system->due_interrupts(0, 2, 0, 1000).empty());  // ISTEXT bit 1: the AICA, SYSINTR 23
+    CHECK(system->due_interrupts(0, 2, 0, 1000 + latency - 1).empty());
+    CHECK(system->due_interrupts(0, 2, 0, 1000 + latency) == std::vector<std::uint32_t>{event});
+    CHECK(system->due_interrupts(0, 2, 0, 1000 + 3 * latency).empty());  // until InterruptDone
+    g.call("InterruptDone", {23});
+    CHECK(system->due_interrupts(0, 0, 0, 1000 + 4 * latency).empty());  // gone: starts again
+    CHECK(system->due_interrupts(0, 2, 0, 1000 + 5 * latency).empty());
+    CHECK(system->due_interrupts(0, 2, 0, 1000 + 6 * latency) == std::vector<std::uint32_t>{event});
+}
+
+TEST_CASE("WinCE CRT: rand, strings and character conversions as COREDLL's") {
+    // What Worms Armageddon calls, each as COREDLL.DLL's own code does it, quirks included.
+    Guest g;
+    CHECK(g.call("rand") == 41);  // the CRT's generator, from seed 1
+    CHECK(g.call("rand") == 18467);
+    g.call("srand", {1});
+    CHECK(g.call("rand") == 41);
+    g.bytes(0, "DATA\\FMV\\MICRO.SFD");
+    g.bytes(40, "FMV");
+    CHECK(g.call("strstr", {g.p(0), g.p(40)}) == g.p(5));
+    g.bytes(50, "XYZ");
+    CHECK(g.call("strstr", {g.p(0), g.p(50)}) == 0);
+    g.bytes(60, "");
+    CHECK(g.call("strstr", {g.p(0), g.p(60)}) == g.p(0));
+    CHECK(g.call("toupper", {'q'}) == 'Q');
+    CHECK(g.call("toupper", {'1'}) == '1');
+    g.bytes(70, "  -1234xyz");
+    CHECK(g.call("atol", {g.p(70)}) == static_cast<std::uint32_t>(-1234));
+    // iswctype: alphabetic (0x103) and digit (4); Latin-1 letters are letters.
+    CHECK(g.call("iswctype", {u'a', 0x103}) != 0);
+    CHECK(g.call("iswctype", {u'5', 0x103}) == 0);
+    CHECK(g.call("iswctype", {u'5', 4}) != 0);
+    CHECK(g.call("iswctype", {0xE9, 0x103}) != 0);
+    g.wide(100, u"wormé");
+    CHECK(g.call("_wcsupr", {g.p(100)}) == g.p(100));
+    CHECK(g.wide_at(g.p(100)) == u"WORMÉ");
+    // A byte is the character of the same code. Without a destination, the size with the
+    // terminator: in bytes for mbstowcs, in characters for wcstombs.
+    g.bytes(140, "Team17");
+    CHECK(g.call("mbstowcs", {0, g.p(140), 0}) == 14);
+    CHECK(g.call("mbstowcs", {g.p(160), g.p(140), 10}) == 6);
+    CHECK(g.wide_at(g.p(160)) == u"Team17");
+    g.wide(200, u"Worms");
+    CHECK(g.call("wcstombs", {0, g.p(200), 0}) == 6);
+    CHECK(g.call("wcstombs", {g.p(220), g.p(200), 3}) == 3);  // no room for the terminator
+    CHECK(g.m.read8(g.p(222)) == 'r');
+    g.wide(240, u"€");  // no byte for it
+    CHECK(g.call("wcstombs", {g.p(250), g.p(240), 4}) == 0xFFFFFFFFu);
+    // MultiByteToWideChar: the size first, then the characters; UTF-8 decoded.
+    g.bytes(300, "caf\xC3\xA9");
+    CHECK(g.call("MultiByteToWideChar", {65001, 0, g.p(300), 0xFFFFFFFFu, 0, 0}) == 5);
+    CHECK(g.call("MultiByteToWideChar", {65001, 0, g.p(300), 0xFFFFFFFFu, g.p(320), 5}) == 5);
+    CHECK(g.wide_at(g.p(320)) == u"café");
+    CHECK(g.call("MultiByteToWideChar", {0, 0, g.p(300), 0xFFFFFFFFu, g.p(320), 2}) == 0);
+    CHECK(g.kernel.last_error() == 122);
+    // 64-bit shifts: (result*, value*, count), 64 and more as a bit at a time would leave.
+    g.m.write32(g.p(400), 0x80000001u);
+    g.m.write32(g.p(404), 0x80000000u);
+    CHECK(g.call("_lshi64", {g.p(416), g.p(400), 4}) == g.p(416));
+    CHECK(g.m.read32(g.p(416)) == 0x00000010u);
+    CHECK(g.m.read32(g.p(420)) == 0x00000008u);
+    g.call("_rshi64", {g.p(416), g.p(400), 4});
+    CHECK(g.m.read32(g.p(416)) == 0x08000000u);
+    CHECK(g.m.read32(g.p(420)) == 0xF8000000u);
+    g.call("_rshi64", {g.p(416), g.p(400), 70});
+    CHECK(g.m.read32(g.p(420)) == 0xFFFFFFFFu);
+    g.call("_rshui64", {g.p(416), g.p(400), 63});
+    CHECK(g.m.read32(g.p(416)) == 1);
+    // swprintf: wsprintfW's conversions.
+    g.wide(500, u"%d worms");
+    CHECK(g.call("swprintf", {g.p(540), g.p(500), 4}) == 7);
+    CHECK(g.wide_at(g.p(540)) == u"4 worms");
+    // GetLocalTime: a SYSTEMTIME from the host's clock.
+    g.call("GetLocalTime", {g.p(600)});
+    CHECK(g.m.read16(g.p(600)) >= 2024);
+    CHECK(g.m.read16(g.p(602)) >= 1);
+    CHECK(g.m.read16(g.p(602)) <= 12);
+}
+
+TEST_CASE("WinCE files: FindFirstFileW lists the disc's files that match a pattern") {
+    // Worms Armageddon looks for each movie with it before it plays one.
+    const auto root = std::filesystem::temp_directory_path() / "dream_wince_find_test";
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root / "DATA" / "FMV");
+    for (const char* name : {"MICRO.SFD", "BRAND.SFD", "README.TXT"}) {
+        std::ofstream out(root / "DATA" / "FMV" / name, std::ios::binary);
+        out << name;
+    }
+    Guest g;
+    g.call("GetLastError");
+    g.kernel.system_services()->set_root(root);
+    g.wide(0, u"\\CD-ROM\\DATA\\FMV\\*.sfd");
+    const auto find = g.call("FindFirstFileW", {g.p(0), g.p(1000)});
+    REQUIRE(find != 0xFFFFFFFFu);
+    CHECK(g.m.read32(g.p(1000)) == 1);            // read only
+    CHECK(g.m.read32(g.p(1032)) == 9);            // nFileSizeLow
+    CHECK(g.wide_at(g.p(1040)) == u"BRAND.SFD");  // in the directory's order
+    CHECK(g.call("FindNextFileW", {find, g.p(1000)}) == 1);
+    CHECK(g.wide_at(g.p(1040)) == u"MICRO.SFD");
+    CHECK(g.call("FindNextFileW", {find, g.p(1000)}) == 0);
+    CHECK(g.kernel.last_error() == 18);  // ERROR_NO_MORE_FILES
+    CHECK(g.call("FindClose", {find}) == 1);
+    CHECK(g.call("FindClose", {find}) == 0);
+    g.wide(0, u"\\CD-ROM\\DATA\\FMV\\VIDEO.SFD");
+    CHECK(g.call("FindFirstFileW", {g.p(0), g.p(1000)}) == 0xFFFFFFFFu);
+    CHECK(g.kernel.last_error() == 2);  // ERROR_FILE_NOT_FOUND
+    g.wide(0, u"\\CD-ROM\\NONE\\*.*");
+    CHECK(g.call("FindFirstFileW", {g.p(0), g.p(1000)}) == 0xFFFFFFFFu);
+    CHECK(g.kernel.last_error() == 3);  // ERROR_PATH_NOT_FOUND
+    g.wide(0, u"\\CD-ROM\\DATA\\*.*");
+    const auto folder = g.call("FindFirstFileW", {g.p(0), g.p(1000)});
+    REQUIRE(folder != 0xFFFFFFFFu);
+    CHECK(g.m.read32(g.p(1000)) == 0x11);  // a read-only folder
+    CHECK(g.wide_at(g.p(1040)) == u"FMV");
+    g.call("FindClose", {folder});
+    std::filesystem::remove_all(root);
 }
 
 TEST_CASE("WinCE files: SetFilePointer moves by its 32-bit distance alone") {

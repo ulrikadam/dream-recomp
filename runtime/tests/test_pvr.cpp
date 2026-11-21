@@ -153,6 +153,21 @@ TEST_CASE("pvr: STARTRENDER completes on the clock; texture and frame-buffer pat
     CHECK(r.core.ta.chunks == before + 1);
 }
 
+TEST_CASE("pvr: the YUV converter raises its interrupt when a texture is complete") {
+    // Written word by word (store queues, as Windows CE's DDHAL feeds Sofdec frames), not by
+    // DMA: the converter itself says when the macroblocks it was told to expect have come.
+    Rig r;
+    auto& m = r.sys.memory;
+    m.write32(0xA05F8148u, 0x00100000u);     // TA_YUV_TEX_BASE
+    m.write32(0xA05F814Cu, 0x00000001u);     // TA_YUV_TEX_CTRL: 2x1 macroblocks
+    for (unsigned i = 0; i < 2 * 96; ++i) {  // 384 bytes a macroblock
+        CHECK(!r.sys.holly.raised(holly::Irq::YuvDma));
+        m.write32(0x10800000u, 0x80808080u);
+    }
+    CHECK(r.sys.holly.raised(holly::Irq::YuvDma));
+    CHECK(m.read32(0xA05F8150u) == 0);  // TA_YUV_TEX_CNT: back to the first
+}
+
 TEST_CASE("pvr: a render draws the parameter buffer PARAM_BASE selects, not the one being filled") {
     // Sega GT double-buffers its parameters: it fills one buffer, opens the next list in the other
     // and then starts the render of the first. Drawing the list just opened (empty) left its menus

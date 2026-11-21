@@ -54,6 +54,7 @@ public:
 
     System& system() { return *system_; }
     pvr::Core& pvr() { return *pvr_; }
+    holly::SysBlock& sysblock() { return *sysblock_; }
     aica::Aica& aica() { return *aica_; }
     holly::G2Dma& g2() { return *g2_; }
     maple::Bus& maple() { return *maple_; }

@@ -285,8 +285,13 @@ void Core::yuv_macroblock() {
         }
     }
 
-    if (++yuv_index_ >= mbs_x * mbs_y)
+    if (++yuv_index_ >= mbs_x * mbs_y) {
+        // The texture is complete: the converter says so with its own interrupt, however the
+        // macroblocks came (channel 2 DMA or store queues; Windows CE's DDHAL uses the latter for
+        // Sofdec movies and waits for it). Flycast does the same.
         yuv_index_ = 0;  // the guest reprograms base/ctrl per frame; wrap rather than run off
+        holly_.raise(holly::Irq::YuvDma);
+    }
     regs_[kTaYuvTexCnt >> 2] = yuv_index_;
 }
 

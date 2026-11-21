@@ -13,6 +13,7 @@ public:
         std::string name;
         Image image;
         bool initialized = false;
+        bool attaching = false;  // its DllMain is running
     };
     using EntryCall =
         std::function<bool(std::uint32_t entry, std::uint32_t instance, unsigned reason)>;
@@ -35,6 +36,10 @@ private:
     std::map<std::string, Module> modules_;
     std::map<std::string, std::uint32_t> hle_modules_;
     std::vector<std::string> pending_;
+    // Modules a DllMain loaded (LoadLibrary from DLL_PROCESS_ATTACH, as CEMM.DLL loads its MIDI
+    // driver): initialized by the initialize() that load's caller makes, before that DllMain goes
+    // on, as on CE; the others still pending wait for the initialize() already running.
+    std::vector<std::string> nested_pending_;
     bool initializing_ = false, failed_ = false;
     std::uint32_t resolve(const Import& symbol, const std::map<std::string, Module>& staged,
                           unsigned depth = 0) const;

@@ -431,6 +431,16 @@ BUTTON a few seconds after it starts, and its menus run at the console's pace. I
 (1.0 s waiting)`): the room left. Its race keeps the console's pace with about a fifth of the
 time to spare (a tenth at the start, every car in view); the loading before it runs at about 0.8.
 
+With sound, the sound device's clock paces the window instead (`LiveWindow::set_pacer`), as
+`boot_main` does for the Katana titles: at each vertical blank the guest waits while the effects'
+queue holds more than `Sink::kPaceFrames` (about 93 ms), so a slow frame eats into that rather
+than cutting the sound. Paced by the wall clock the queue held only the 46 ms cushion a gap
+leaves, and a slow frame in the race cut the engine. The frames line then also counts the gaps
+(`sound gaps N`). What is left: where the guest is slower than the console for longer (the car
+and name selection screens, about 0.8, their 3D car and per-vertex lighting in MGameGL and
+DDHAL; a heavy moment of a race now that the sound works, the race having less room than
+before), the queue empties and the sound breaks up. Only more speed mends that.
+
 A window has sound (`--no-audio` turns it off; a run without a window is silent), in two parts
 that the sound device mixes:
 
@@ -490,10 +500,94 @@ What took Sega Rally 2 from ARCADE to a race:
 
 Next for speed: the race keeps the console's pace in a window, with little room at its start;
 what is left is the interpreter's dispatch, one instruction at a time (the WinCE executables are
-not statically recompiled). Also open: the GD-ROM device
-(`\Device\CDROM0`, code 0x25040, served by WSEGACD.DLL once a GD-ROM drive is emulated), WDMLIB's
-`KernelIoControl(1)`, a BIOS MISC call 1 (return to the console menu) during start-up that is
-ignored, and what the title asks when a track ends (not yet seen: a menu track lasts minutes).
+not statically recompiled). Also open: WDMLIB's `KernelIoControl(1)`, a BIOS MISC call 1 (return
+to the console menu) during start-up that is ignored, and what the title asks when a track ends
+(not yet seen: a menu track lasts minutes).
+
+### Sound effects (2026-11-21)
+
+Played, Sega Rally 2 had its CD music and nothing else: no menu sounds, no engine. The run report
+said why once it counted it (`sound:` key-ons and samples that were not zero, `G2 DMA:` words
+that were not zero): the sound driver started two voices in a whole session, its output was
+silence throughout, and the 3.6 MB DMA'd to sound RAM were all zeros. Five causes, one under the
+other:
+
+- **locked pages were copies made once.** `MmProbeAndLockPages` copies the process's bytes into
+  console RAM, where the DMA reads them; SNDCORE locks a sound buffer once and transfers from it
+  again and again while the title goes on writing it. Each G2 DMA now brings the locked pages it
+  reads up to date first, and gives back what one writes into RAM
+  (`SystemServices::sync_locked`, through `G2Dma::before_read`/`after_write`): on the console
+  they are the same RAM. The menus' streamed music (`ig98_sel.wav`) came back with this;
+- **no MIDI driver.** The effects are MIDI, played by SEGAMIDI.DLL on the AICA; `midiOutOpen`
+  (CEMM.DLL) answered MMSYSERR_BADDEVICEID and the title loaded none of its banks (`*_se.mpb`).
+  CEMM finds its drivers under `HKLM\Software\Microsoft\Windows CE\CurrentVersion\Drivers32`
+  (values `midi`, `midi1`... `midi9`), which the console's ROM registry fills: `dream-wince`
+  now sets `midi = segamidi.dll` when the disc has it, before the DLLs start;
+- **`LocalAlloc(LMEM_MOVEABLE)` was refused.** CEMM asks for movable memory for each driver;
+  COREDLL's own refuses only the flags 0xF08D covers (0xF00D, and discardable ones without
+  LMEM_MODIFY, for `LocalReAlloc`) and gives fixed memory otherwise, as it now does here;
+- **`LoadLibrary` inside a `DllMain` was refused.** CEMM loads SEGAMIDI.DLL from its own
+  DLL_PROCESS_ATTACH. `Modules` now loads it and attaches it (and what it needs) before that
+  `LoadLibrary` returns, as CE does; the other modules still pending wait for the outer
+  initialization, in their order;
+- **the IST answered too soon.** SNDCORE writes commands for the ARM7 driver into 32 slots of 16
+  bytes in sound RAM (at the offset the driver's header gives at 0xD0: 0x13200), rings a
+  doorbell (0x13400), and asks for an answer with a 0x9E in the last slot; the driver raises
+  the SH-4's interrupt for it and, a few instructions later, clears the slot. Woken at once, the
+  IST wrote its next 0x9E there before that clear, which wiped it: no answer came and every
+  thread waited. An interrupt now reaches its thread `SystemServices::kIstLatency` (10,000
+  cycles, 50 us, at least one sound sample) after the hardware raised it, as the kernel's ISR,
+  event and thread switch take on the console; the sound driver runs a slice meanwhile.
+
+With them the menus have their sounds and music and the race its engine: of a 70-second run
+through the menus into a race, 89% of the samples are sound, the race's all of them, and the
+renders and speed are as before. New aids: `DREAM_WINCE_WAV=file` writes the AICA's output to a
+WAV file (with or without a window), `DREAM_WINCE_ARAM=offset[,length]` prints sound RAM at the
+end, `DREAM_WINCE_PEEK` now also prints at a normal end, `DREAM_G2DMA_TRACE=N` the first N G2
+DMA transfers, and `DREAM_DEVINTERP_TRACE_AT=pc[:N]` N interpreted instructions from the first
+time any thread reaches pc.
+
+## Worms Armageddon (2026-11-21)
+
+The second Windows CE disc of the local collection (T40601D 50, PAL). It uses the plain CE stack
+rather than Sega's MGame libraries: GAME.EXE imports DDRAW, DSOUND, DINPUTX, MAPLEDEV and
+PLATUTIL, and plays CRI Sofdec movies (CRI SFD 1.21). Its disc keeps the OS's files in a WINCE
+folder at the root, which `dream-wince` now searches after the title's own folder (modules and
+ARMCOM.DRV). Not set up for the launcher yet; run by hand:
+
+```
+dream-wince --run games/wormsarmageddon/extracted/fs/GAME.EXE --lazy --real-directx --disc disc.gdi
+```
+
+What it took to reach its first movie, each general:
+
+- COREDLL: `rand`/`srand` (the CRT's generator, as COREDLL's), `strstr`, `toupper`, `atol`,
+  `iswctype`, `_wcsupr`, `mbstowcs`/`wcstombs` (byte for character, and COREDLL's sizes without a
+  destination: (length + 1) * 2 bytes and length + 1), `MultiByteToWideChar` (ANSI as Latin-1,
+  UTF-8 decoded), `swprintf`, `GetLocalTime`/`GetSystemTime` (the host's clock), and the 64-bit
+  shifts `_lshi64`, `_rshi64`, `_rshui64` ((result*, value*, count));
+- `FindFirstFileW`, `FindNextFileW`, `FindClose` over the disc's files, the last part of the
+  name a `*`/`?` pattern, in CE's WIN32_FIND_DATAW (it looks for each movie before playing it);
+- the YUV converter raises its interrupt itself when a texture is complete, however the
+  macroblocks came (`pvr::Core::yuv_macroblock`): DDHAL feeds Sofdec frames through the store
+  queues, not channel-2 DMA, whose end still raises it as before;
+- the CD driver's play by tracks, `0x25020` {first, last, repeats} (WSEGACD.DLL hands it to the
+  BIOS as GD-ROM command 20, PLAY; `CdAudioOutput::play` takes the repeats, 15 for ever), and
+  `0x25040`, a mode byte the driver keeps for itself (Sega Rally 2 sends it too);
+- the run report's `video:` line counts the converter's input words, the YUV transfers by DMA
+  and the texture words.
+
+Where it stops:
+
+- the first movie (DATA/FMV/MICRO.SFD) converts 24 textures (2,359,296 YUV words, none by DMA)
+  and then nothing more, and no render shows one: the screen stays black while the guest keeps
+  working. Sofdec times its frames from its ADX sound, so that is the next thing to look at;
+- with the movies taken away (a copy of the files without DATA/FMV/*.SFD: the title skips one it
+  does not find), it draws its first screens (142 renders in 300 frames), asks for CD track 4 and
+  then writes through a null pointer at game.exe+0x99794: game.exe+0x983a6 calls the third
+  method of the object a table at +12 of 0x10020488 holds at index 5 (from game.exe+0xf2e6), and
+  that method is not one that takes only `this`. The object does not look like what the caller
+  expects; why is open.
 
 ## Validation
 

@@ -111,8 +111,9 @@ void SysBlock::ch2_dma() {
         // The YUV converter has its own end-of-transfer interrupt, separate from the channel-2 one
         // below: hardware raises it when the converter has consumed the macroblocks it was told to
         // expect. Kamui's YUV texture loader waits on exactly this and retires nothing without it.
-        // Raised on transfer completion here, which is as accurate as the converter itself is until
-        // it actually converts (WP2.3).
+        // The converter raises it on a complete texture (pvr::Core::yuv_macroblock); it is also
+        // raised at the end of every transfer here, as before the converter did, so that a title
+        // sending a texture in several transfers sees what it saw then.
         if (dst & (pvr::Core::kYuvBase - pvr::Core::kFifoBase)) {
             ++ch2_yuv_transfers;
             holly_.raise(Irq::YuvDma);

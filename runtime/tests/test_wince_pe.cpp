@@ -336,8 +336,14 @@ TEST_CASE("WinCE COREDLL: heap errors TLS clock and exit") {
     CHECK(call("LocalFree", p + 4) == p + 4);
     CHECK(call("GetLastError") == 6);
     CHECK(call("LocalFree", p) == 0);
-    CHECK(call("LocalAlloc", 2, 100) == 0);
+    // COREDLL refuses the flags 0xF08D covers; LMEM_MOVEABLE (2) gives fixed memory, as CEMM.DLL
+    // needs when it loads the MIDI driver.
+    CHECK(call("LocalAlloc", 0x80, 100) == 0);  // LMEM_MODIFY
     CHECK(call("GetLastError") == 87);
+    const auto movable = call("LocalAlloc", 0x42, 16);
+    REQUIRE(movable != 0);
+    CHECK(memory.read32(movable) == 0);
+    CHECK(call("LocalFree", movable) == 0);
     const auto slot = call("TlsAlloc");
     CHECK(slot == 0);
     CHECK(call("TlsSetValue", slot, 0xCAFE) == 1);

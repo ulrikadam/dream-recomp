@@ -53,6 +53,28 @@ std::uint64_t trace_budget() {
     return budget;
 }
 
+// DREAM_DEVINTERP_TRACE_AT=pc[:N] prints N instructions (200 by default) from the first time any
+// run reaches pc: the same lines, for a path deep in a title. A debugging aid: the count is shared
+// by every thread.
+struct TraceAt {
+    std::uint32_t pc = 1;  // odd: never reached
+    std::uint64_t count = 0;
+};
+const TraceAt& trace_at() {
+    static const TraceAt at = [] {
+        TraceAt t;
+        if (const char* v = std::getenv("DREAM_DEVINTERP_TRACE_AT")) {
+            char* end = nullptr;
+            t.pc = static_cast<std::uint32_t>(std::strtoul(v, &end, 0));
+            t.count = end && *end == ':' ? std::strtoull(end + 1, nullptr, 0) : 200;
+        }
+        return t;
+    }();
+    return at;
+}
+std::uint64_t trace_left = 0;  // instructions still to print after TRACE_AT's pc was reached
+bool trace_fired = false;      // it was: once only
+
 // sh4::decode of every instruction word, done once: decoding each executed instruction again was
 // a sixth of the interpreter's time. Same decoder, so nothing changes but the cost.
 struct Decoded {
@@ -103,6 +125,7 @@ struct Machine {
     const std::uint32_t return_to;
     const Decoded& dec = decoded();
     const std::uint64_t trace = trace_budget();
+    std::uint32_t trace_pc = trace_fired ? 1u : trace_at().pc;
     // The code being run, read in place while it stays valid (Memory::code_span); without one,
     // each instruction goes through fetch16.
     ::dream::CodeSpan span{};
@@ -175,7 +198,12 @@ struct Machine {
         if (entry.raw != w)
             entry = dec.ins[w];
         const Instr ins = entry;
-        if (st.instructions < trace)
+        if (pc == trace_pc && trace_pc != 1) {
+            trace_left = trace_at().count;
+            trace_pc = 1;  // once
+            trace_fired = true;
+        }
+        if (st.instructions < trace || (trace_left && trace_left--))
             std::fprintf(stderr,
                          "  interp %08x  %04x  %-28s r0=%08x r15=%08x pr=%08x sr=%08x spc=%08x "
                          "ssr=%08x\n",

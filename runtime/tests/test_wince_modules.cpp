@@ -53,6 +53,31 @@ TEST_CASE("WinCE modules: exports, ordinals, dependency cycles and automatic reb
     h.modules.initialize({});
     CHECK(initialized.size() == 2);
 }
+TEST_CASE("WinCE modules: a DllMain that loads a library gets it attached at once") {
+    // CEMM.DLL loads the MIDI driver (SEGAMIDI.DLL) from its own DLL_PROCESS_ATTACH: CE runs the
+    // new DLL's before that LoadLibrary returns. Refused, Sega Rally 2 had no sound effects.
+    Harness h;
+    h.files["a.dll"] = module();
+    h.files["c.dll"] = module();
+    h.modules.load("test.exe", module(false, "a.dll"));
+    std::vector<std::string> events;
+    Modules::EntryCall attach;
+    attach = [&](auto, auto instance, auto) {
+        const bool outer = instance == h.modules.handle("a.dll");
+        events.push_back(outer ? "a in" : "c");
+        if (outer) {
+            CHECK(h.modules.load_library("c.dll") != 0);
+            h.modules.initialize(attach);
+            events.push_back("a out");
+        }
+        return true;
+    };
+    h.modules.initialize(attach);
+    CHECK(events == std::vector<std::string>{"a in", "c", "a out"});
+    h.modules.load_library("c.dll");  // again: attached already, nothing runs twice
+    h.modules.initialize(attach);
+    CHECK(events.size() == 3);
+}
 TEST_CASE("WinCE modules: forwarded name and ordinal exports") {
     Harness h;
     h.files["a.dll"] = module(true, "", "B.#1");

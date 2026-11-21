@@ -23,7 +23,7 @@ public:
     // Opens the sound device and starts the thread. False with `error` set (no device).
     bool start(std::string& error);
 
-    void play(std::uint32_t start_fad, std::uint32_t end_fad) override;
+    void play(std::uint32_t start_fad, std::uint32_t end_fad, unsigned repeats) override;
     void stop() override;
     void pause() override;
     void resume() override;

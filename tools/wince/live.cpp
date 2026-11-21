@@ -71,6 +71,7 @@ struct LiveWindow::Impl {
     bool paced = false;
     std::int64_t pace_offset = 0;  // the wall clock minus the guest's, in nanoseconds
     std::uint64_t waited = 0;      // nanoseconds spent holding the guest back, for reports
+    std::function<void()> pacer;   // set_pacer's; empty: the wall clock paces
 
     // --- the window thread's own ------------------------------------------------------------
     struct Gfx {
@@ -374,7 +375,14 @@ void LiveWindow::vblank() {
     // A window plays in real time. With its busy-waits skipped a title's menu needs a fraction
     // of a frame's time, so the guest is held back to the wall clock here, at 200 MHz; one more
     // than 100 ms behind (a load, a heavy scene) is not made to race to catch up afterwards.
-    {
+    if (d.pacer) {
+        // With sound the device's clock paces the guest instead (set_pacer), as boot_main does
+        // for the Katana titles: paced by the wall clock, a slow frame emptied the sound queue
+        // and Sega Rally 2's engine stuttered.
+        const auto before = SDL_GetTicksNS();
+        d.pacer();
+        d.waited += SDL_GetTicksNS() - before;
+    } else {
         const auto guest = static_cast<std::int64_t>(d.hardware.system().sched.now() * 5);
         const auto wall = static_cast<std::int64_t>(SDL_GetTicksNS());
         if (!d.paced || wall - d.pace_offset > guest + 100'000'000) {
@@ -443,6 +451,9 @@ std::uint64_t LiveWindow::renders() const {
 }
 std::uint64_t LiveWindow::presented() const {
     return impl_->presented;
+}
+void LiveWindow::set_pacer(std::function<void()> pacer) {
+    impl_->pacer = std::move(pacer);
 }
 double LiveWindow::waited_seconds() const {
     return static_cast<double>(impl_->waited) / 1e9;

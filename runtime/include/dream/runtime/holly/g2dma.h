@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 
 #include "dream/runtime/holly/intc.h"
 #include "dream/runtime/mem/dc_memory.h"
@@ -33,7 +34,12 @@ public:
     std::uint32_t reg(unsigned channel, std::uint32_t offset) const noexcept {
         return regs_[channel * 8 + offset / 4];
     }
-    std::uint64_t transfers = 0, bytes = 0, refused = 0, to_aica_ram = 0;
+    std::uint64_t transfers = 0, bytes = 0, refused = 0, to_aica_ram = 0,
+                  nonzero_words = 0;  // words moved that were not 0, to tell silence from data
+    // A transfer's source just before it is read and its destination just after it is written
+    // (addresses as the channel's registers give them). Where system RAM only stands in for
+    // memory kept elsewhere (dream-wince's locked process pages) the owner brings it up to date.
+    std::function<void(std::uint32_t address, std::uint32_t length)> before_read, after_write;
 
 private:
     void start(unsigned channel);

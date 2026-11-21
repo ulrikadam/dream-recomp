@@ -19,6 +19,8 @@ struct CdAudio::Impl {
     std::condition_variable wake;
     bool quit = false, playing = false, paused = false;
     std::uint32_t fad = 0, end = 0;   // the next sector to play, and where to stop
+    std::uint32_t start = 0;          // where a repeat starts again
+    unsigned repeats = 0;             // plays left after this one; 15: for ever
     float left = 1.0f, right = 1.0f;  // the title's volume, 0 to 1
     std::atomic<std::uint64_t> sectors{0};
 
@@ -60,6 +62,11 @@ void CdAudio::Impl::loop() {
             wake.wait(lock, [&] { return quit || (playing && !paused); });
             if (quit)
                 return;
+            if (fad >= end && repeats) {
+                fad = start;  // the drive plays it again
+                if (repeats != 15)
+                    --repeats;
+            }
             if (fad >= end) {
                 playing = false;
                 continue;
@@ -87,11 +94,12 @@ void CdAudio::Impl::loop() {
     }
 }
 
-void CdAudio::play(std::uint32_t start_fad, std::uint32_t end_fad) {
+void CdAudio::play(std::uint32_t start_fad, std::uint32_t end_fad, unsigned repeats) {
     {
         std::lock_guard lock(impl_->mutex);
-        impl_->fad = start_fad;
+        impl_->fad = impl_->start = start_fad;
         impl_->end = end_fad;
+        impl_->repeats = repeats;
         impl_->playing = true;
         impl_->paused = false;
     }

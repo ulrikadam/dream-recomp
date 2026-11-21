@@ -174,8 +174,9 @@ public:
     void set_scheduler(Scheduler* scheduler, ProcessMemory* memory = nullptr);
     // Holly's interrupt status, as the OAL sees it: signals the IST events now due. `wake` as
     // Synchronization::set_event. True when any event was signalled.
+    // `now`: the devices' time, for SystemServices::due_interrupts' latency.
     bool deliver_interrupts(std::uint32_t istnrm, std::uint32_t istext, std::uint32_t isterr,
-                            bool wake);
+                            bool wake, std::uint64_t now);
     std::map<std::uint32_t, std::uint64_t> interrupt_counts() const;  // SYSINTR -> deliveries
     // The registry, files and devices; made on first use (needs set_scheduler's memory or a
     // first service call). Null before either.

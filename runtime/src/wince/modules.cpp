@@ -92,8 +92,8 @@ std::uint32_t Modules::procedure(std::uint32_t module, const Import& symbol) con
 }
 std::uint32_t Modules::load(const std::string& requested, std::span<const std::uint8_t> file,
                             std::optional<std::uint32_t> base) {
-    if (initializing_ || failed_)
-        throw PeError("module loading unavailable during or after failed initialization");
+    if (failed_)
+        throw PeError("module loading unavailable after failed initialization");
     const auto root = normalize(requested);
     if (const auto old = handle(root))
         return old;
@@ -171,20 +171,31 @@ std::uint32_t Modules::load(const std::string& requested, std::span<const std::u
     // All-or-nothing installation, including conflicts with existing process allocations.
     auto candidate = memory_;
     for (const auto& name : order) candidate.install(staged.at(name).image);
-    auto next_pending = pending_;
+    auto& list = initializing_ ? nested_pending_ : pending_;
+    auto next_pending = list;
     next_pending.insert(next_pending.end(), order.begin(), order.end());
     const auto result = staged.at(root).image.base;
     memory_ = std::move(candidate);
     modules_.merge(staged);
-    pending_ = std::move(next_pending);
+    list = std::move(next_pending);
     return result;
 }
 std::uint32_t Modules::load_library(const std::string& name) {
-    if (failed_ || initializing_)
-        throw PeError("recursive or failed module initialization");
+    if (failed_)
+        throw PeError("failed module initialization");
     const auto key = normalize(name);
-    if (const auto old = handle(key))
+    if (const auto old = handle(key)) {
+        // Loaded by an initialization still under way but not yet attached: a DllMain that
+        // loads it gets it initialized first, as CE does.
+        if (const auto it = modules_.find(key); initializing_ && it != modules_.end() &&
+                                                !it->second.initialized && !it->second.attaching) {
+            std::erase(pending_, key);
+            if (std::find(nested_pending_.begin(), nested_pending_.end(), key) ==
+                nested_pending_.end())
+                nested_pending_.push_back(key);
+        }
         return old;
+    }
     if (!provider_)
         throw PeError("no module provider for " + key);
     const auto data = provider_(key);
@@ -193,21 +204,32 @@ std::uint32_t Modules::load_library(const std::string& name) {
     return load(key, data);
 }
 void Modules::initialize(const EntryCall& call) {
-    if (initializing_ || failed_)
-        throw PeError("recursive or failed module initialization");
+    if (failed_)
+        throw PeError("failed module initialization");
+    // Called again from inside a DllMain (after a LoadLibrary there), it attaches only what such
+    // loads added; the outer call goes on with the rest afterwards.
+    const bool outer = !initializing_;
+    auto& list = outer ? pending_ : nested_pending_;
     initializing_ = true;
     try {
-        for (const auto& name : pending_) {
+        while (!list.empty()) {
+            const auto name = list.front();
+            list.erase(list.begin());
             auto& m = modules_.at(name);
-            if (!m.initialized && m.image.dll && m.image.entry &&
-                (!call || !call(m.image.entry, m.image.base, 1)))
+            if (m.initialized || m.attaching)
+                continue;
+            m.attaching = true;
+            if (m.image.dll && m.image.entry && (!call || !call(m.image.entry, m.image.base, 1)))
                 throw PeError("DLL_PROCESS_ATTACH failed: " + name);
-            m.initialized = true;
+            auto& done = modules_.at(name);  // the map may have grown while it ran
+            done.attaching = false;
+            done.initialized = true;
         }
-        pending_.clear();
-        initializing_ = false;
+        if (outer)
+            initializing_ = false;
     } catch (...) {
-        initializing_ = false;
+        if (outer)
+            initializing_ = false;
         failed_ = true;
         throw;
     }

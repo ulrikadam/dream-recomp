@@ -1,6 +1,9 @@
 // G2 bus DMA; see g2dma.h.
 #include "dream/runtime/holly/g2dma.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace dream::holly {
 
 namespace {
@@ -70,9 +73,27 @@ void G2Dma::start(unsigned ch) {
     }
     if (r[kDir / 4] == 1u)
         std::swap(src, dst);
-    for (std::uint32_t i = 0; i < len; i += 4) memory_.write32(dst + i, memory_.read32(src + i));
+    if (before_read)
+        before_read(src, len);
+    std::uint64_t nonzero = 0;
+    for (std::uint32_t i = 0; i < len; i += 4) {
+        const std::uint32_t word = memory_.read32(src + i);
+        nonzero += word != 0;
+        memory_.write32(dst + i, word);
+    }
+    if (after_write)
+        after_write(dst, len);
     ++transfers;
     bytes += len;
+    nonzero_words += nonzero;
+    // DREAM_G2DMA_TRACE=N: the first N transfers, with how much of each was not zero.
+    static const std::uint64_t traced = [] {
+        const char* v = std::getenv("DREAM_G2DMA_TRACE");
+        return v ? std::strtoull(v, nullptr, 0) : 0ull;
+    }();
+    if (transfers <= traced)
+        std::fprintf(stderr, "g2dma: ch%u 0x%08x -> 0x%08x, %u bytes, %llu words not zero\n", ch,
+                     src, dst, len, static_cast<unsigned long long>(nonzero));
     if ((dst & 0x1F000000u) == 0x00000000u && (dst & 0x00800000u))
         to_aica_ram += len;
     r[kSt / 4] = 1u;  // in progress until the end-of-DMA interrupt

@@ -332,17 +332,64 @@ int main(int argc, char** argv) {
         dream::audio::Sink effects;
         std::unique_ptr<CdAudio> cd_audio;
         if (audio) {
-            if (effects.open())
+            if (effects.open()) {
                 hardware.aica().on_sample = [&](std::int16_t l, std::int16_t r) {
                     effects.push(l, r);
                 };
-            else
+#ifdef DREAM_WINCE_WINDOW
+                // The sound device's clock paces the window (the AICA makes one sample per tick
+                // of guest time): its queue is kept near kPaceFrames (about 93 ms), and a slow
+                // frame eats into that instead of cutting the sound.
+                if (live)
+                    live->set_pacer(
+                        [&] { effects.wait_below(dream::audio::Sink::kPaceFrames, 1000); });
+#endif
+            } else
                 std::fprintf(stderr, "wince: no sound: %s\n", effects.error().c_str());
         }
 #else
         if (audio)
             std::fprintf(stderr, "wince: no sound in this build (SDL3 was not found)\n");
 #endif
+        // DREAM_WINCE_WAV=file: the AICA's output also goes to a WAV file (44.1 kHz, 16-bit
+        // stereo), with or without a window: sound one can check without listening live.
+        std::ofstream wav;
+        std::uint32_t wav_frames = 0;
+        if (const char* path = std::getenv("DREAM_WINCE_WAV")) {
+            wav.open(path, std::ios::binary);
+            if (!wav)
+                throw std::runtime_error(std::string("DREAM_WINCE_WAV: cannot write ") + path);
+            wav.write(std::string(44, '\0').data(), 44);  // the header, once the length is known
+            auto heard = hardware.aica().on_sample;
+            hardware.aica().on_sample = [&, heard](std::int16_t l, std::int16_t r) {
+                const std::int16_t frame[2] = {l, r};  // little-endian host, as WAV
+                wav.write(reinterpret_cast<const char*>(frame), 4);
+                ++wav_frames;
+                if (heard)
+                    heard(l, r);
+            };
+        }
+        auto finish_wav = [&] {
+            if (!wav.is_open())
+                return;
+            const std::uint32_t data = wav_frames * 4;
+            auto put32 = [&](std::uint32_t v) { wav.write(reinterpret_cast<const char*>(&v), 4); };
+            auto put16 = [&](std::uint16_t v) { wav.write(reinterpret_cast<const char*>(&v), 2); };
+            wav.seekp(0);
+            wav.write("RIFF", 4);
+            put32(36 + data);
+            wav.write("WAVEfmt ", 8);
+            put32(16);
+            put16(1);  // PCM
+            put16(2);
+            put32(44100);
+            put32(44100 * 4);
+            put16(4);
+            put16(16);
+            wav.write("data", 4);
+            put32(data);
+            wav.close();
+        };
         // DREAM_WINCE_PRESS=start@300,a@420: scripted pad presses, each held 30 frames from that
         // vertical blank on, on top of the player's (a bring-up aid: does the title answer?).
         struct Press {
@@ -378,6 +425,9 @@ int main(int argc, char** argv) {
 #ifdef DREAM_WINCE_WINDOW
         double waited_before = 0;
 #endif
+#ifdef DREAM_WINCE_AUDIO
+        std::uint64_t gaps_before = 0;
+#endif
         auto frames_wall = std::chrono::steady_clock::now();
         hardware.on_vblank = [&] {
             if (frames_every) {
@@ -400,6 +450,15 @@ int main(int argc, char** argv) {
                         std::chrono::duration<double>(now - frames_wall).count());
                     if (waited >= 0)
                         std::fprintf(stderr, " (%.1f s waiting)", waited);
+#ifdef DREAM_WINCE_AUDIO
+                    // And the gaps in the effects' sound since the last line: where it ran dry.
+                    if (effects.is_open()) {
+                        std::fprintf(
+                            stderr, " sound gaps %llu",
+                            static_cast<unsigned long long>(effects.starved - gaps_before));
+                        gaps_before = effects.starved;
+                    }
+#endif
                     std::fputc('\n', stderr);
                     renders_before = hardware.pvr().renders;
                     frames_wall = now;
@@ -505,39 +564,57 @@ int main(int argc, char** argv) {
         const auto path = std::filesystem::absolute(argv[2]);
         const auto directory = std::filesystem::canonical(path.parent_path());
         kernel.set_file_root(directory);
-        // The OS image's start-up (SYSSTART.EXE) loads the sound driver before any title runs.
+        // Where the disc keeps the OS's own files: beside the title (Sega Rally 2) or in a WINCE
+        // folder at its root (Worms Armageddon). The title's folder comes first.
+        std::vector<std::filesystem::path> os_directories{directory};
         for (const auto& item : std::filesystem::directory_iterator(directory)) {
             auto name = item.path().filename().string();
             for (auto& ch : name)
-                if (ch >= 'A' && ch <= 'Z')
-                    ch = static_cast<char>(ch + 32);
-            if (name == "armcom.drv" && item.is_regular_file()) {
-                const auto driver = read_file(item.path());
-                hardware.boot_sound(driver);
-                std::fprintf(stderr, "wince: sound driver armcom.drv (%zu bytes) started\n",
-                             driver.size());
-            }
+                if (ch >= 'a' && ch <= 'z')
+                    ch = static_cast<char>(ch - 32);
+            if (name == "WINCE" && item.is_directory())
+                os_directories.push_back(std::filesystem::canonical(item.path()));
         }
+        // The OS image's start-up (SYSSTART.EXE) loads the sound driver before any title runs.
+        bool sound_driver = false;
+        for (const auto& folder : os_directories)
+            for (const auto& item : std::filesystem::directory_iterator(folder)) {
+                auto name = item.path().filename().string();
+                for (auto& ch : name)
+                    if (ch >= 'A' && ch <= 'Z')
+                        ch = static_cast<char>(ch + 32);
+                if (name == "armcom.drv" && item.is_regular_file() && !sound_driver) {
+                    const auto driver = read_file(item.path());
+                    hardware.boot_sound(driver);
+                    sound_driver = true;
+                    std::fprintf(stderr, "wince: sound driver armcom.drv (%zu bytes) started\n",
+                                 driver.size());
+                }
+            }
         // Kernel-mode DLLs (PLATUTIL.DLL) call the Dreamcast BIOS through its vectors.
         for (unsigned i = 0; i < SystemServices::kBiosVectors.size(); ++i)
             memory.map_word(SystemServices::kBiosVectors[i], SystemServices::bios_stub(i));
         // Case-insensitive PE basenames also work on case-sensitive development hosts.
         std::map<std::string, std::filesystem::path> files;
-        for (const auto& item : std::filesystem::directory_iterator(directory)) {
-            if (!item.is_regular_file())
-                continue;
-            auto ext = item.path().extension().string();
-            for (auto& c : ext)
-                if (c >= 'A' && c <= 'Z')
-                    c = static_cast<char>(c + 32);
-            if (ext != ".dll" && ext != ".exe")
-                continue;
-            const auto physical = std::filesystem::canonical(item.path());
-            if (physical.parent_path() != directory)
-                continue;
-            const auto name = Modules::normalize(item.path().filename().string());
-            if (!files.emplace(name, physical).second)
-                throw PeError("ambiguous module basename: " + name);
+        for (const auto& folder : os_directories) {
+            std::set<std::string> here;  // two of one name in a folder: ambiguous
+            for (const auto& item : std::filesystem::directory_iterator(folder)) {
+                if (!item.is_regular_file())
+                    continue;
+                auto ext = item.path().extension().string();
+                for (auto& c : ext)
+                    if (c >= 'A' && c <= 'Z')
+                        c = static_cast<char>(c + 32);
+                if (ext != ".dll" && ext != ".exe")
+                    continue;
+                const auto physical = std::filesystem::canonical(item.path());
+                if (physical.parent_path() != folder)
+                    continue;
+                const auto name = Modules::normalize(item.path().filename().string());
+                if (!here.insert(name).second)
+                    throw PeError("ambiguous module basename: " + name);
+                files.emplace(name, physical);  // a module in an earlier folder wins
+            }
         }
         // --real-directx: the disc's own DDRAW/DSOUND run (on emulated hardware) instead of the
         // guest-COM replacements; only COREDLL, the kernel's interface, stays replaced.
@@ -827,7 +904,8 @@ int main(int argc, char** argv) {
                 now = std::max(now, std::min(events.next_deadline(), limit));
                 hardware.advance_to(now);
                 const auto& holly = hardware.system().holly;
-                if (kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, true) ||
+                if (kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, true,
+                                              hardware.system().sched.now()) ||
                     now >= limit)
                     break;
             }
@@ -915,7 +993,8 @@ int main(int argc, char** argv) {
                 hardware.advance_to(ctx.cycles);  // vblanks and renders keep time
                 {
                     const auto& holly = hardware.system().holly;
-                    kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, true);
+                    kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, true,
+                                              hardware.system().sched.now());
                 }
                 hardware_time += std::chrono::steady_clock::now() - hardware_start;
                 scheduler->preempt(Scheduler::kQuantum);
@@ -971,7 +1050,8 @@ int main(int argc, char** argv) {
         scheduler->run_devices = [&](std::uint64_t cycles) {
             hardware.advance_to(cycles);
             const auto& holly = hardware.system().holly;
-            return kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, false);
+            return kernel.deliver_interrupts(holly.istnrm, holly.istext, holly.isterr, false,
+                                             hardware.system().sched.now());
         };
         // Watchdog: a run that stops executing (threads waiting on each other on the host side)
         // reports every thread's state and ends instead of hanging. DREAM_WINCE_STATUS=N also
@@ -1147,6 +1227,22 @@ int main(int argc, char** argv) {
             return std::nullopt;
         };
         kernel.set_class_resolver(resolver);
+        // The console's MIDI driver, as its ROM registry lists it for CEMM.DLL (which reads the
+        // values midi, midi1... midi9 of DRIVERS32): SEGAMIDI.DLL plays MIDI on the AICA. Without
+        // it midiOutOpen fails (MMSYSERR_BADDEVICEID) and Sega Rally 2 loads no sound effects.
+        if (files.contains("segamidi.dll")) {
+            std::vector<std::uint8_t> dll;
+            for (const char16_t c : std::u16string(u"segamidi.dll")) {
+                dll.push_back(static_cast<std::uint8_t>(c));
+                dll.push_back(static_cast<std::uint8_t>(c >> 8));
+            }
+            dll.insert(dll.end(), {0, 0});
+            if (auto* system = kernel.system_services())
+                system->set_value(
+                    u"HKEY_LOCAL_MACHINE\\Software\\Microsoft\\Windows "
+                    u"CE\\CurrentVersion\\Drivers32",
+                    u"midi", 1 /* REG_SZ */, dll);
+        }
         modules.initialize(enter);
         // --register: what installing the title did. Each DLL beside the executable that exports
         // DllRegisterServer writes its COM classes into the registry, so OLE32 finds them.
@@ -1208,6 +1304,16 @@ int main(int argc, char** argv) {
                 scheduler->wait([] { return false; }, cpu.cycles + 200'000'000ull);
             }
         }
+        // The sound DMA reads the pages SNDCORE locked as the title has them now, as on the
+        // console, where they are the same RAM (SystemServices::sync_locked).
+        hardware.g2().before_read = [&](std::uint32_t address, std::uint32_t length) {
+            if (auto* services = kernel.system_services())
+                services->sync_locked(address, length, true);
+        };
+        hardware.g2().after_write = [&](std::uint32_t address, std::uint32_t length) {
+            if (auto* services = kernel.system_services())
+                services->sync_locked(address, length, false);
+        };
         // --disc: the disc image the title came from, for what it asks the CD-ROM device (its
         // table of contents, CD audio) while no GD-ROM driver runs.
         if (!disc_image.empty()) {
@@ -1242,6 +1348,21 @@ int main(int argc, char** argv) {
                 std::fprintf(
                     stderr, "module %-20s 0x%08x-0x%08x\n", name.c_str(), module.image.base,
                     module.image.base + static_cast<std::uint32_t>(module.image.bytes.size()));
+        // DREAM_WINCE_PEEK=addr[,addr]: the words at those process addresses when the run ends
+        // (or fails): a title's own state, read at the end.
+        auto peek = [&] {
+            const char* list = std::getenv("DREAM_WINCE_PEEK");
+            for (std::string_view rest(list ? list : ""); !rest.empty();) {
+                const auto comma = rest.find(',');
+                const auto address = number(rest.substr(0, comma));
+                try {
+                    std::fprintf(stderr, "peek 0x%08x = 0x%08x\n", address, memory.read32(address));
+                } catch (const std::exception&) {
+                    std::fprintf(stderr, "peek 0x%08x: unreadable\n", address);
+                }
+                rest = comma == rest.npos ? std::string_view() : rest.substr(comma + 1);
+            }
+        };
         dream::devinterp::Stats stats;
         auto result = dream::devinterp::Stop::Returned;
         const auto run_start = std::chrono::steady_clock::now();
@@ -1253,19 +1374,8 @@ int main(int argc, char** argv) {
             result = dream::devinterp::Stop::StepLimit;
         } catch (const std::runtime_error& e) {
             save_last();
-            // DREAM_WINCE_PEEK=addr[,addr]: the words at those process addresses when it failed.
-            if (const char* peek = std::getenv("DREAM_WINCE_PEEK"))
-                for (std::string_view rest(peek); !rest.empty();) {
-                    const auto comma = rest.find(',');
-                    const auto address = number(rest.substr(0, comma));
-                    try {
-                        std::fprintf(stderr, "peek 0x%08x = 0x%08x\n", address,
-                                     memory.read32(address));
-                    } catch (const std::exception&) {
-                        std::fprintf(stderr, "peek 0x%08x: unreadable\n", address);
-                    }
-                    rest = comma == rest.npos ? std::string_view() : rest.substr(comma + 1);
-                }
+            finish_wav();
+            peek();
             // DREAM_WINCE_MODULES: where every module sits, to read addresses in the message.
             if (std::getenv("DREAM_WINCE_MODULES"))
                 for (const auto& [name, module] : modules.all())
@@ -1287,10 +1397,15 @@ int main(int argc, char** argv) {
                                      where(cpu.pr) + regs + "]");
         }
         save_last();
+        finish_wav();
+        peek();
         std::cout << "instructions=" << stats.instructions << " HLE calls=" << stats.native_calls
                   << " DLL instructions=" << dll_instructions << " r0=" << cpu.r[0] << "\n";
         std::cout << "video: frames=" << hardware.system().spg.frames() << " renders=" << renders
-                  << " device accesses=" << hardware.accesses() << "\n";
+                  << " device accesses=" << hardware.accesses()
+                  << " yuv words=" << hardware.pvr().yuv_words
+                  << " yuv DMA=" << hardware.sysblock().ch2_yuv_transfers
+                  << " texture words=" << hardware.pvr().texture_words << "\n";
         if (wait_skips || poll_skips)
             std::cout << "busy-waits skipped=" << wait_skips << " polls skipped=" << poll_skips
                       << " guest time skipped="
@@ -1355,16 +1470,41 @@ int main(int argc, char** argv) {
                   << std::count_if(hardware.system().memory.aram(),
                                    hardware.system().memory.aram() + (2u << 20),
                                    [](std::uint8_t b) { return b != 0; })
-                  << " bytes\n";
+                  << " bytes key-ons=" << hardware.aica().mixer.key_ons
+                  << " nonzero samples=" << hardware.aica().mixer.nonzero_samples
+                  << " channel writes=" << hardware.aica().channel_writes
+                  << " DSP writes=" << hardware.aica().dsp_writes
+                  << " to ARM=" << hardware.aica().scpu_to_arm
+                  << " to SH-4=" << hardware.aica().scpu_to_sh4
+                  << " timer irqs=" << hardware.aica().timer_irqs << "\n";
 #ifdef DREAM_WINCE_AUDIO
         if (effects.is_open())
             std::cout << "heard: effects samples=" << effects.pushed << " blocks=" << effects.blocks
                       << " gaps=" << effects.starved << " dropped=" << effects.dropped
                       << " CD sectors=" << (cd_audio ? cd_audio->sectors_played() : 0) << "\n";
 #endif
+        // DREAM_WINCE_ARAM=offset[,length]: sound RAM there at the end (the sound driver's
+        // command slots, its rings), sixteen bytes a line, the lines that are not all zero.
+        if (const char* v = std::getenv("DREAM_WINCE_ARAM")) {
+            const std::string_view text(v);
+            const auto comma = text.find(',');
+            const auto at = number(text.substr(0, comma)) & 0x1FFFF0u;
+            const auto length =
+                comma == text.npos ? 0x200u : std::min(number(text.substr(comma + 1)), 0x10000u);
+            const std::uint8_t* aram = hardware.system().memory.aram();
+            for (std::uint32_t line = at; line < at + length && line + 16 <= (2u << 20);
+                 line += 16) {
+                if (std::all_of(aram + line, aram + line + 16, [](std::uint8_t b) { return !b; }))
+                    continue;
+                std::printf("aram %06x:", line);
+                for (unsigned i = 0; i < 16; ++i) std::printf(" %02x", aram[line + i]);
+                std::printf("\n");
+            }
+        }
         std::cout << "G2 DMA: transfers=" << hardware.g2().transfers
                   << " bytes=" << hardware.g2().bytes << " refused=" << hardware.g2().refused
-                  << " to sound RAM=" << hardware.g2().to_aica_ram << "\n";
+                  << " to sound RAM=" << hardware.g2().to_aica_ram
+                  << " nonzero words=" << hardware.g2().nonzero_words << "\n";
         std::cout << "store queues: bursts mapped=" << hardware.system().memory.sq_tlb_flushes
                   << " unmapped=" << hardware.system().memory.sq_tlb_misses << "\n";
         std::cout << "maple: transfers=" << hardware.maple().transfers

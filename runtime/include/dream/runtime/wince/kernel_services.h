@@ -16,5 +16,8 @@ private:
     ProcessMemory& memory_;
     Heaps heaps_;
     std::vector<std::u16string> debug_;
+    // rand's state. COREDLL keeps one per thread; one for the process, as a title that draws
+    // from rand on one thread sees the same sequence either way.
+    std::uint32_t rand_seed_ = 1;
 };
 }  // namespace dream::wince

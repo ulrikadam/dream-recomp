@@ -38,7 +38,9 @@ public:
 class CdAudioOutput {
 public:
     virtual ~CdAudioOutput() = default;
-    virtual void play(std::uint32_t start_fad, std::uint32_t end_fad) = 0;
+    // From start_fad up to end_fad, then again `repeats` more times (15: for ever), as the
+    // GD-ROM drive's PLAY command does.
+    virtual void play(std::uint32_t start_fad, std::uint32_t end_fad, unsigned repeats) = 0;
     virtual void stop() = 0;
     virtual void pause() = 0;
     virtual void resume() = 0;
@@ -89,6 +91,12 @@ public:
     }
     // Without one, CD audio requests are accepted and nothing is heard.
     void set_cd_audio(CdAudioOutput* out) { cd_audio_ = out; }
+    // Pages MmProbeAndLockPages locked are copies in console RAM of process memory, which the
+    // title goes on writing: on the console they are the same RAM. Before a DMA reads the
+    // physical range [address, +length) (to_ram) the copies it covers take the process's bytes
+    // as they are now; after one writes there (!to_ram) the process gets the copies' bytes.
+    // SNDCORE locks a sound buffer once and transfers from it again and again.
+    void sync_locked(std::uint32_t address, std::uint32_t length, bool to_ram);
     // Signals a synchronization event (a request answered at once still sets the OVERLAPPED's).
     void set_event_signaller(std::function<void(std::uint32_t)> signal) {
         signal_event_ = std::move(signal);
@@ -109,9 +117,16 @@ public:
 
     // The OAL's Holly interrupt routing (nk.exe, at 0x8C02E000 in the Dreamcast OS image):
     // given the status registers, the IST events to signal now. A SYSINTR fires once, then waits
-    // for InterruptDone, as the OAL masks it until then.
+    // for InterruptDone, as the OAL masks it until then. It fires kIstLatency device cycles after
+    // `now` first saw it pending, not sooner: on the console the kernel's ISR, the event and the
+    // switch to the IST take tens of microseconds, and the hardware goes on meanwhile. SNDCORE's
+    // IST writes the sound driver's next command where the driver, a few ARM instructions after
+    // raising the interrupt, still clears the last one: at once, the command was lost and the
+    // sound system stalled.
+    // At least one sound sample (4,535 cycles), the ARM7 running a slice of its own meanwhile.
+    static constexpr std::uint64_t kIstLatency = 10'000;  // 50 us at 200 MHz
     std::vector<std::uint32_t> due_interrupts(std::uint32_t istnrm, std::uint32_t istext,
-                                              std::uint32_t isterr);
+                                              std::uint32_t isterr, std::uint64_t now);
 
 private:
     struct WindowClass {
@@ -154,11 +169,17 @@ private:
     std::map<std::uint32_t, DmaBuffer> dma_by_id_;
     std::uint32_t dma_next_ = kDmaPoolStart;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> dma_free_;            // physical, bytes
-    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> locked_;  // MDL -> copy
+    struct Locked {
+        std::uint32_t physical, span;  // the copy in console RAM, whole pages
+        std::uint32_t process, count;  // the bytes it copies: process address, length
+        std::uint32_t offset;          // where they start in the copy's first page
+    };
+    std::map<std::uint32_t, Locked> locked_;  // MDL -> its copy
     struct Interrupt {
         std::uint32_t event;
         bool armed;  // InterruptDone since the last time it fired
         std::uint64_t fired = 0;
+        std::optional<std::uint64_t> pending_since;  // armed and pending from then on
     };
 
 public:
@@ -202,6 +223,17 @@ private:
                                    std::uint32_t& returned);
     std::filesystem::path root_;
     std::map<std::uint32_t, File> files_;
+    // FindFirstFileW searches: what is left to hand out, as (name, size, folder).
+    struct Found {
+        std::u16string name;
+        std::uint64_t size = 0;
+        bool folder = false;
+    };
+    struct Search {
+        std::vector<Found> left;
+        std::size_t next = 0;
+    };
+    std::map<std::uint32_t, Search> searches_;
     std::uint32_t next_file_ = 0x1D500000;
     std::vector<std::uint32_t> refused_device_ioctls_;
     std::vector<std::u16string> devices_opened_;  // folded names, each reported once

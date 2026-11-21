@@ -102,6 +102,9 @@ Bring-up tools added while chasing the first Crazy Taxi task switch (2026-09-12)
 disassembly, r0/r15/PR/SR/SPC/SSR). On the first Crazy Taxi boot this showed, in six lines, that the
 untranslated target was a run-time copy of the context-restore stub and that the context it restored
 was all zeros, which is the next bring-up question, not an interpreter one.
+`DREAM_DEVINTERP_TRACE_AT=pc[:N]` prints the same lines for N instructions (200 by default) from
+the first time any run reaches pc: a path deep in a title, such as the call where Sega Rally 2's
+`midiOutOpen` failed.
 
 Interpreter options that exist for these tools: `Options::native_lo/native_hi` (always call the
 BIOS hooks natively even with `call_translated` off), `Options::catch_nonlocal` (the harness lets a

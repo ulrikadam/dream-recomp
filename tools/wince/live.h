@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,6 +33,9 @@ public:
     // player holds it now goes onto the Maple bus. Waits first while the guest's clock is ahead
     // of the wall's: a window plays in real time.
     void vblank();
+    // What paces the guest at each vertical blank instead of the wall clock: the sound device's
+    // queue when there is sound (it waits while the queue is above a level).
+    void set_pacer(std::function<void()> pacer);
     // The player closed the window (or pressed escape): the run should end.
     bool closed() const;
 

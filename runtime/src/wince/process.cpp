@@ -596,11 +596,11 @@ void Kernel::set_scheduler(Scheduler* scheduler, ProcessMemory* memory) {
     point_kdata(scheduler->current_id());
 }
 bool Kernel::deliver_interrupts(std::uint32_t istnrm, std::uint32_t istext, std::uint32_t isterr,
-                                bool wake) {
+                                bool wake, std::uint64_t now) {
     if (!system_ || !synchronization_)
         return false;
     bool any = false;
-    for (const auto event : system_->due_interrupts(istnrm, istext, isterr))
+    for (const auto event : system_->due_interrupts(istnrm, istext, isterr, now))
         any |= synchronization_->set_event(event, wake);
     return any;
 }

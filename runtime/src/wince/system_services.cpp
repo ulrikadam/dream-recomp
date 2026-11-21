@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <string_view>
 
 #include "dream/runtime/wince/abi.h"
@@ -36,7 +37,8 @@ constexpr std::uint32_t kBase = 0x1F006000;
                                                             X(MmUnlockPages) X(HalMapInterrupt)   \
                                                                 X(WriteFile) X(MapPtrToProcess)   \
                                                                     X(GetCallerProcess)           \
-                                                                        X(PostKeybdMessage)
+                                                                        X(PostKeybdMessage)       \
+    X(FindFirstFileW) X(FindNextFileW) X(FindClose)
 #define ENUM(name) name,
 enum class Api { WINCE_SYSTEM(ENUM) Count };
 #undef ENUM
@@ -66,6 +68,29 @@ std::u16string read_wide(Memory& m, std::uint32_t p, unsigned limit = 1024) {
         s += static_cast<char16_t>(c);
     }
     throw std::invalid_argument("unterminated UTF-16 string");
+}
+// A FindFirstFileW pattern against a name, both folded: '*' any run, '?' one character. "*.*"
+// is every name, with or without a dot, as on CE.
+bool matches(const std::u16string& pattern, const std::u16string& name) {
+    if (pattern == u"*.*")
+        return true;
+    std::size_t p = 0, n = 0, star = std::u16string::npos, mark = 0;
+    while (n < name.size()) {
+        if (p < pattern.size() && (pattern[p] == u'?' || pattern[p] == name[n])) {
+            ++p;
+            ++n;
+        } else if (p < pattern.size() && pattern[p] == u'*') {
+            star = p++;
+            mark = n;
+        } else if (star != std::u16string::npos) {
+            p = star + 1;
+            n = ++mark;
+        } else {
+            return false;
+        }
+    }
+    while (p < pattern.size() && pattern[p] == u'*') ++p;
+    return p == pattern.size();
 }
 void write_wide(ProcessMemory& m, std::uint32_t p, const std::u16string& s) {
     if (p & 1u)
@@ -363,16 +388,25 @@ const Route* route_of(std::uint32_t sysintr) {
 
 std::vector<std::uint32_t> SystemServices::due_interrupts(std::uint32_t istnrm,
                                                           std::uint32_t istext,
-                                                          std::uint32_t isterr) {
+                                                          std::uint32_t isterr, std::uint64_t now) {
     std::vector<std::uint32_t> events;
     for (const auto& route : kRoutes) {
         const auto enabled = enabled_of(route.sysintr);
-        if (!(istnrm & route.nrm & enabled) && !(istext & route.ext & enabled) &&
-            !(isterr & route.err & enabled))
-            continue;
         const auto it = interrupts_.find(route.sysintr);
+        if (!(istnrm & route.nrm & enabled) && !(istext & route.ext & enabled) &&
+            !(isterr & route.err & enabled)) {
+            if (it != interrupts_.end())
+                it->second.pending_since.reset();  // gone before its thread saw it
+            continue;
+        }
         if (it == interrupts_.end() || !it->second.armed)
             continue;
+        auto& since = it->second.pending_since;
+        if (!since)
+            since = now;
+        if (now - *since < kIstLatency)
+            continue;
+        since.reset();
         it->second.armed = false;
         if (it->second.fired++ == 0)  // the totals are in interrupt_counts()
             std::fprintf(stderr,
@@ -449,9 +483,42 @@ std::optional<bool> SystemServices::cd_request(std::uint32_t code, std::uint32_t
                              cd_audio_ ? "" : " (not heard: no sound output)");
             }
             if (cd_audio_)
-                cd_audio_->play(start, end);
+                cd_audio_->play(start, end, 0);
             return true;
         }
+        case 0x25020: {
+            // The Dreamcast CD driver's play by tracks (WSEGACD.DLL hands it to the BIOS as
+            // GD-ROM command 20, PLAY): {first track, last track, repeats}. Worms Armageddon's
+            // music.
+            if (!in || in_size < 12)
+                return false;
+            const auto first = memory_.read32(in), last = memory_.read32(in + 4);
+            const auto repeats = memory_.read32(in + 8) & 15u;
+            std::optional<std::uint32_t> start, end;
+            for (const auto& t : cd_tracks_) {
+                if (t.number == first)
+                    start = t.lba + 150;
+                if (t.number == last + 1)
+                    end = t.lba + 150;
+            }
+            if (!start || last < first)
+                return false;
+            if (!end)
+                end = cd_leadout_ + 150;
+            if (std::find(cd_plays_reported_.begin(), cd_plays_reported_.end(), first) ==
+                cd_plays_reported_.end()) {
+                cd_plays_reported_.push_back(first);
+                std::fprintf(stderr, "wince: CD audio: play track %u%s\n", first,
+                             cd_audio_ ? "" : " (not heard: no sound output)");
+            }
+            if (cd_audio_)
+                cd_audio_->play(*start, *end, repeats);
+            return true;
+        }
+        case 0x25040:
+            // The driver keeps the byte for itself (WSEGACD.DLL: a mode in its device
+            // extension) and answers at once; nothing here depends on it.
+            return in && in_size >= 4;
         case 0x24004:  // IOCTL_CDROM_SEEK_AUDIO_MSF: playback stops there
         case 0x24008:  // IOCTL_CDROM_STOP_AUDIO
             if (cd_audio_)
@@ -480,6 +547,45 @@ std::optional<bool> SystemServices::cd_request(std::uint32_t code, std::uint32_t
             return true;
         default:
             return std::nullopt;
+    }
+}
+
+void SystemServices::sync_locked(std::uint32_t address, std::uint32_t length, bool to_ram) {
+    const std::uint32_t lo = address & 0x1FFFFFFFu, hi = lo + length;
+    for (const auto& [mdl, l] : locked_) {
+        const std::uint32_t first = l.physical + l.offset, last = first + l.count;
+        const std::uint32_t from = std::max(lo, first), to = std::min(hi, last);
+        if (from >= to)
+            continue;
+        const std::uint32_t process = l.process + (from - first), n = to - from;
+        // Console RAM through its uncached P2 view, a word at a time where both sides allow.
+        if (to_ram) {
+            const auto bytes = memory_.read_bytes(process, n);
+            for (std::uint32_t i = 0; i < n;) {
+                const auto at = 0xA0000000u | (from + i);
+                if (!(at & 3) && n - i >= 4) {
+                    std::uint32_t word;
+                    std::memcpy(&word, bytes.data() + i, 4);
+                    memory_.write32(at, word);
+                    i += 4;
+                } else {
+                    memory_.write8(at, bytes[i++]);
+                }
+            }
+        } else {
+            std::vector<std::uint8_t> bytes(n);
+            for (std::uint32_t i = 0; i < n;) {
+                const auto at = 0xA0000000u | (from + i);
+                if (!(at & 3) && n - i >= 4) {
+                    const auto word = memory_.read32(at);
+                    std::memcpy(bytes.data() + i, &word, 4);
+                    i += 4;
+                } else {
+                    bytes[i++] = memory_.read8(at);
+                }
+            }
+            memory_.write_bytes(process, bytes);
+        }
     }
 }
 
@@ -844,6 +950,93 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
             result = handle;
             break;
         }
+        case Api::FindFirstFileW:
+        case Api::FindNextFileW: {
+            // FindFirstFileW(lpFileName, lpFindFileData) over the disc's files, the last part of
+            // the name a pattern; FindNextFileW(hFind, lpFindFileData). CE's WIN32_FIND_DATAW:
+            // attributes, three FILETIMEs (left 0), size high and low, dwOID, cFileName[260].
+            constexpr std::uint32_t kInvalid = 0xFFFFFFFFu;
+            const bool first = static_cast<Api>((target - kBase) / 4) == Api::FindFirstFileW;
+            const auto out = arg(1);
+            auto give = [&](const Found& f) {
+                std::vector<std::uint8_t> data(40 + 260 * 2);
+                const auto put = [&](std::size_t at, std::uint32_t v) {
+                    for (unsigned i = 0; i < 4; ++i)
+                        data[at + i] = static_cast<std::uint8_t>(v >> (8 * i));
+                };
+                put(0, f.folder ? 0x11u : 0x01u);  // read only, and a folder
+                put(28, static_cast<std::uint32_t>(f.size >> 32));
+                put(32, static_cast<std::uint32_t>(f.size));
+                for (std::size_t i = 0; i < f.name.size() && i < 259; ++i) {
+                    data[40 + i * 2] = static_cast<std::uint8_t>(f.name[i]);
+                    data[41 + i * 2] = static_cast<std::uint8_t>(f.name[i] >> 8);
+                }
+                memory_.write_bytes(out, data);
+            };
+            if (!first) {
+                const auto it = searches_.find(arg(0));
+                result = 0;
+                if (it == searches_.end()) {
+                    last_error = kInvalidHandle;
+                    break;
+                }
+                if (it->second.next >= it->second.left.size()) {
+                    last_error = 18;  // ERROR_NO_MORE_FILES
+                    break;
+                }
+                give(it->second.left[it->second.next++]);
+                result = 1;
+                break;
+            }
+            result = kInvalid;
+            const auto name = read_wide(memory, arg(0));
+            const auto cut = name.find_last_of(u"\\/");
+            const auto pattern = fold(cut == std::u16string::npos ? name : name.substr(cut + 1));
+            const auto parent =
+                cut == std::u16string::npos ? std::u16string() : name.substr(0, cut);
+            std::optional<std::filesystem::path> folder;
+            if (const auto f = fold(parent); f.empty() || f == u"\\cd-rom" || f == u"cd-rom")
+                folder = root_.empty() ? std::nullopt : std::optional(root_);
+            else
+                folder = host_path(parent);
+            std::error_code ec;
+            if (!out || pattern.empty() || !folder || !std::filesystem::is_directory(*folder, ec)) {
+                std::fprintf(stderr, "wince: find \"%s\": no such folder\n", narrow(name).c_str());
+                last_error = 3;  // ERROR_PATH_NOT_FOUND
+                break;
+            }
+            Search search;
+            for (const auto& item : std::filesystem::directory_iterator(*folder, ec)) {
+                const auto u16 = item.path().filename().u16string();
+                const std::u16string entry(u16.begin(), u16.end());
+                if (!matches(pattern, fold(entry)))
+                    continue;
+                const bool is_folder = item.is_directory(ec);
+                search.left.push_back(Found{
+                    entry, is_folder ? 0 : std::filesystem::file_size(item.path(), ec), is_folder});
+            }
+            // In the order the disc's directory lists them (ISO 9660 sorts names).
+            std::sort(search.left.begin(), search.left.end(),
+                      [](const Found& x, const Found& y) { return fold(x.name) < fold(y.name); });
+            std::fprintf(stderr, "wince: find \"%s\": %zu found\n", narrow(name).c_str(),
+                         search.left.size());
+            if (search.left.empty()) {
+                last_error = 2;  // ERROR_FILE_NOT_FOUND
+                break;
+            }
+            give(search.left[0]);
+            search.next = 1;
+            const auto handle = next_file_;
+            next_file_ += 4;
+            searches_[handle] = std::move(search);
+            result = handle;
+            break;
+        }
+        case Api::FindClose:
+            result = searches_.erase(arg(0)) ? 1u : 0u;
+            if (!result)
+                last_error = kInvalidHandle;
+            break;
         case Api::ReadFile: {
             // (hFile, lpBuffer, nNumberOfBytesToRead, lpNumberOfBytesRead, lpOverlapped)
             const auto it = files_.find(arg(0));
@@ -1559,17 +1752,11 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                 physical = dma_next_;
                 dma_next_ += span;
             }
-            const auto bytes = memory_.read_bytes(start + offset, count);
-            for (std::uint32_t i = 0; i < count; i += 4) {
-                std::uint32_t word = 0;
-                for (std::uint32_t b = 0; b < 4 && i + b < count; ++b)
-                    word |= static_cast<std::uint32_t>(bytes[i + b]) << (8 * b);
-                memory.write32(0xA0000000u | (physical + offset + i), word);
-            }
             for (std::uint32_t i = 0; i < pages; ++i)
                 memory.write32(mdl + 24 + i * 4, (physical >> 12) + i);
             memory.write16(mdl + 6, static_cast<std::uint16_t>(memory.read16(mdl + 6) | 0x0002u));
-            locked_[mdl] = {physical, span};
+            locked_[mdl] = {physical, span, start + offset, count, offset};
+            sync_locked(physical + offset, count, true);  // the bytes as they are now
             break;
         }
         case Api::HalMapInterrupt:
@@ -1581,7 +1768,7 @@ bool SystemServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
             break;
         case Api::MmUnlockPages:
             if (const auto it = locked_.find(arg(0)); it != locked_.end()) {
-                dma_free_.push_back(it->second);
+                dma_free_.emplace_back(it->second.physical, it->second.span);
                 locked_.erase(it);
             }
             break;

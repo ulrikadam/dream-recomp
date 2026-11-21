@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <ctime>
 #include <limits>
 #include <string_view>
 
@@ -35,7 +37,10 @@ constexpr std::uint32_t kBase = 0x1F002000, kStringLimit = 1u << 20;
                                                                             X(_itoui64) X(_itoi64) \
                                                                                 X(_itos) X(_utos)  \
                                                                                     X(_stoi)       \
-                                                                                        X(_stou)
+                                                                                        X(_stou)   \
+    X(_lshi64) X(_rshi64) X(_rshui64) X(rand) X(srand) X(strstr) X(toupper) X(atol) X(iswctype)    \
+        X(_wcsupr) X(mbstowcs) X(wcstombs) X(MultiByteToWideChar) X(swprintf) X(GetLocalTime)      \
+            X(GetSystemTime)
 #define ENUM(name) name,
 enum class Api { WINCE_SERVICES(ENUM) Count };
 #undef ENUM
@@ -88,6 +93,45 @@ void write_string(ProcessMemory& m, std::uint32_t base, const std::vector<std::u
 }
 std::uint32_t fold(std::uint32_t c) {
     return c >= 'A' && c <= 'Z' ? c + 32 : c;
+}
+// The character classes iswctype tests, in the CRT's bits (_UPPER 1, _LOWER 2, _DIGIT 4,
+// _SPACE 8, _PUNCT 0x10, _CONTROL 0x20, _BLANK 0x40, _HEX 0x80, alphabetic 0x100): the C locale,
+// and Latin-1 above it as the wide functions see it (accented letters are letters).
+std::uint32_t ctype(std::uint32_t c) {
+    if (c < 0x80) {
+        std::uint32_t t = 0;
+        if (c >= 'A' && c <= 'Z')
+            t |= 0x101;
+        if (c >= 'a' && c <= 'z')
+            t |= 0x102;
+        if (c >= '0' && c <= '9')
+            t |= 0x84;
+        if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))
+            t |= 0x80;
+        if (c == ' ' || (c >= 9 && c <= 13))
+            t |= 8;
+        if (c == ' ' || c == 9)
+            t |= 0x40;
+        if (c < 0x20 || c == 0x7F)
+            t |= 0x20;
+        if (c > 0x20 && c < 0x7F && !(t & 0x107))
+            t |= 0x10;
+        return t;
+    }
+    if (c < 0xA0)
+        return 0x20;  // C1 controls
+    if (c == 0xA0)
+        return 0x48;  // no-break space
+    if (c > 0xFF)
+        return 0;
+    if (c < 0xC0 || c == 0xD7 || c == 0xF7)
+        return 0x10;
+    return c < 0xDF ? 0x101u : 0x102u;
+}
+std::uint32_t upper(std::uint32_t c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 0xE0 && c <= 0xFE && c != 0xF7))
+        return c - 32;
+    return c == 0xFF ? 0x178u : c;
 }
 std::uint32_t compare(Memory& m, std::uint32_t a, std::uint32_t b, bool wide, bool insensitive,
                       std::uint32_t count = kStringLimit, bool bounded = false) {
@@ -225,13 +269,17 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
     // that a copy, free or interlocked access to invalid memory completed successfully.
     if (api <= Api::HeapValidate || (api >= Api::VirtualAlloc && api <= Api::VirtualQuery) ||
         api == Api::QueryPerformanceCounter || api == Api::QueryPerformanceFrequency ||
-        api == Api::wsprintfW || api == Api::wvsprintfW) {
+        api == Api::wsprintfW || api == Api::wvsprintfW || api == Api::MultiByteToWideChar) {
         const auto failure = api == Api::LocalFree ? a : api == Api::HeapSize ? 0xFFFFFFFFu : 0u;
         result = failure;
         try {
             switch (api) {
                 case Api::LocalAlloc:
-                    require(!(a & ~0x40u));
+                    // The flags COREDLL's own refuses (ERROR_INVALID_PARAMETER): the others,
+                    // LMEM_MOVEABLE among them, give fixed memory, as on CE. CEMM.DLL asks for
+                    // movable memory when it loads the MIDI driver; refused, Sega Rally 2 had no
+                    // MIDI and no sound effects.
+                    require(!(a & 0xFFFFF08Du));
                     result = heaps_.allocate(Heaps::kProcess, b, true, local);
                     break;
                 case Api::LocalFree:
@@ -245,7 +293,8 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                     result = 0;
                     break;
                 case Api::LocalReAlloc:
-                    require(!(d & ~0x42u));
+                    // As COREDLL's: these bits refused, and discardable ones only with LMEM_MODIFY.
+                    require(!(d & 0xFFFFF00Du) && (!(d & 0xF00u) || (d & 0x80u)));
                     result =
                         heaps_.reallocate(Heaps::kProcess, a, b, (d & 0x40) != 0, !(d & 2), local);
                     break;
@@ -312,6 +361,65 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                                     api == Api::QueryPerformanceCounter ? c.cycles : 200000000ull);
                     result = 1;
                     break;
+                case Api::MultiByteToWideChar: {
+                    // (code page, flags, source, its bytes or -1 to its terminator, destination,
+                    // its characters or 0 for the size needed). The ANSI and OEM pages are taken
+                    // as Latin-1, as COREDLL's mbstowcs does; UTF-8 is decoded.
+                    const auto out = argument(c, memory_, 4), room = argument(c, memory_, 5);
+                    require(d && e != 0 &&
+                            (a == 0 || a == 1 || a == 1252 || a == 28591 || a == 65001));
+                    std::vector<std::uint32_t> bytes;
+                    if (e == 0xFFFFFFFFu) {
+                        bytes = string(memory_, d, false);
+                        bytes.push_back(0);
+                    } else {
+                        require(e <= kStringLimit);
+                        for (std::uint32_t i = 0; i < e; ++i)
+                            bytes.push_back(unit(memory_, d, i, false));
+                    }
+                    std::vector<std::uint32_t> wide;
+                    for (std::size_t i = 0; i < bytes.size(); ++i) {
+                        auto ch = bytes[i];
+                        if (a == 65001 && ch >= 0x80) {
+                            // A lead byte and its continuations; a malformed one is U+FFFD.
+                            const unsigned more = ch >= 0xF0   ? 3
+                                                  : ch >= 0xE0 ? 2
+                                                  : ch >= 0xC0 ? 1
+                                                               : 0;
+                            std::uint32_t cp = ch & (0x3Fu >> more);
+                            bool ok = more != 0 && i + more < bytes.size();
+                            for (unsigned k = 1; ok && k <= more; ++k) {
+                                ok = (bytes[i + k] & 0xC0) == 0x80;
+                                cp = cp << 6 | (bytes[i + k] & 0x3F);
+                            }
+                            if (!ok) {
+                                wide.push_back(0xFFFD);
+                                continue;
+                            }
+                            i += more;
+                            if (cp >= 0x10000) {
+                                cp -= 0x10000;
+                                wide.push_back(0xD800 + (cp >> 10));
+                                ch = 0xDC00 + (cp & 0x3FF);
+                            } else
+                                ch = cp;
+                        }
+                        wide.push_back(ch);
+                    }
+                    const auto count = static_cast<std::uint32_t>(wide.size());
+                    if (!room) {
+                        result = count;
+                        break;
+                    }
+                    require(out && !(out & 1));
+                    if (count > room) {
+                        error = 122;  // ERROR_INSUFFICIENT_BUFFER
+                        break;
+                    }
+                    write_string(memory_, out, wide, true);
+                    result = count;
+                    break;
+                }
                 case Api::wsprintfW:
                 case Api::wvsprintfW: {
                     unsigned index = 0;
@@ -631,6 +739,145 @@ bool KernelServices::invoke(sh4::Ctx& c, Memory& memory, std::uint32_t target,
                 if (i + 1 == kStringLimit)
                     throw std::runtime_error("unterminated CRT search");
             }
+            break;
+        }
+        case Api::_lshi64:
+        case Api::_rshi64:
+        case Api::_rshui64: {
+            // (result*, value*, count), as COREDLL's own, which shifts one bit `count` times:
+            // 64 and more leave 0, or the sign.
+            std::uint64_t v = static_cast<std::uint64_t>(memory_.read32(at(b, 0))) |
+                              static_cast<std::uint64_t>(memory_.read32(at(b, 4))) << 32;
+            if (api == Api::_lshi64)
+                v = d >= 64 ? 0 : v << d;
+            else if (api == Api::_rshui64)
+                v = d >= 64 ? 0 : v >> d;
+            else
+                v = static_cast<std::uint64_t>(static_cast<std::int64_t>(v) >> (d >= 64 ? 63 : d));
+            memory_.write32(at(a, 0), static_cast<std::uint32_t>(v));
+            memory_.write32(at(a, 4), static_cast<std::uint32_t>(v >> 32));
+            result = a;
+            break;
+        }
+        case Api::srand:
+            rand_seed_ = a;
+            result = 0;
+            break;
+        case Api::rand:
+            // The CRT's generator, as COREDLL's (Worms Armageddon).
+            rand_seed_ = rand_seed_ * 214013u + 2531011u;
+            result = (rand_seed_ >> 16) & 0x7FFFu;
+            break;
+        case Api::strstr: {
+            const auto text = string(memory_, a, false), sought = string(memory_, b, false);
+            const auto it = std::search(text.begin(), text.end(), sought.begin(), sought.end());
+            result = it == text.end() && !sought.empty()
+                         ? 0u
+                         : a + static_cast<std::uint32_t>(it - text.begin());
+            break;
+        }
+        case Api::toupper:
+            result = a >= 'a' && a <= 'z' ? a - 32 : a;  // the C locale
+            break;
+        case Api::atol: {
+            // As COREDLL's: white space, a sign, digits; no overflow check.
+            std::uint32_t i = 0, value = 0;
+            auto ch = unit(memory_, a, i, false);
+            while (ch == ' ' || (ch >= 9 && ch <= 13)) ch = unit(memory_, a, ++i, false);
+            const bool minus = ch == '-';
+            if (ch == '-' || ch == '+')
+                ch = unit(memory_, a, ++i, false);
+            for (; ch >= '0' && ch <= '9'; ch = unit(memory_, a, ++i, false))
+                value = value * 10 + (ch - '0');
+            result = minus ? 0u - value : value;
+            break;
+        }
+        case Api::iswctype:
+            result = (a & 0xFFFF) == 0xFFFF ? 0u : ctype(a & 0xFFFF) & b;  // WEOF: none
+            break;
+        case Api::_wcsupr: {
+            auto text = string(memory_, a, true);
+            for (auto& ch : text) ch = upper(ch);
+            write_string(memory_, a, text, true);
+            result = a;
+            break;
+        }
+        case Api::mbstowcs:
+        case Api::wcstombs: {
+            // COREDLL's own: a byte is the character of the same code (Latin-1), a character
+            // above 0xFF fails (-1). Without a destination they give the size the whole string
+            // takes with its terminator, in bytes: (length + 1) * 2 and length + 1. With one,
+            // at most `d` characters, terminated when there is room, and the count without it.
+            const bool to_wide = api == Api::mbstowcs;
+            const auto text = a ? string(memory_, b, !to_wide, std::min(d, kStringLimit), true)
+                                : string(memory_, b, !to_wide);
+            const auto wide_only = [](std::uint32_t ch) { return ch > 0xFF; };
+            if (!a) {
+                const auto n = static_cast<std::uint32_t>(text.size()) + 1;
+                result = !to_wide && std::any_of(text.begin(), text.end(), wide_only) ? 0xFFFFFFFFu
+                         : to_wide                                                    ? n * 2
+                                                                                      : n;
+                break;
+            }
+            std::vector<std::uint32_t> copy;
+            bool failed = false;
+            for (const auto ch : text) {
+                if (!to_wide && wide_only(ch)) {
+                    failed = true;  // what came before it is written, as the guest's loop does
+                    break;
+                }
+                copy.push_back(ch);
+            }
+            result = failed ? 0xFFFFFFFFu : static_cast<std::uint32_t>(copy.size());
+            if (!failed && copy.size() < d)
+                copy.push_back(0);
+            if (!copy.empty())
+                write_string(memory_, a, copy, to_wide);
+            break;
+        }
+        case Api::swprintf: {
+            // swprintf(buffer, format, ...): wsprintfW's conversions; anything else faults.
+            unsigned index = 0;
+            auto output =
+                formatted(memory_, b, [&]() { return argument(c, memory_, 2 + index++); });
+            const auto count = static_cast<std::uint32_t>(output.size());
+            output.push_back(0);
+            write_string(memory_, a, output, true);
+            result = count;
+            break;
+        }
+        case Api::GetLocalTime:
+        case Api::GetSystemTime: {
+            // SYSTEMTIME from the host's clock, as the console's own clock would give it.
+            const auto now = std::chrono::system_clock::now();
+            const std::time_t t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm{};
+#ifdef _WIN32
+            if (api == Api::GetLocalTime)
+                localtime_s(&tm, &t);
+            else
+                gmtime_s(&tm, &t);
+#else
+            if (api == Api::GetLocalTime)
+                localtime_r(&t, &tm);
+            else
+                gmtime_r(&t, &tm);
+#endif
+            const auto ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch())
+                    .count() %
+                1000;
+            const std::array<std::uint32_t, 8> fields{static_cast<std::uint32_t>(tm.tm_year + 1900),
+                                                      static_cast<std::uint32_t>(tm.tm_mon + 1),
+                                                      static_cast<std::uint32_t>(tm.tm_wday),
+                                                      static_cast<std::uint32_t>(tm.tm_mday),
+                                                      static_cast<std::uint32_t>(tm.tm_hour),
+                                                      static_cast<std::uint32_t>(tm.tm_min),
+                                                      static_cast<std::uint32_t>(tm.tm_sec),
+                                                      static_cast<std::uint32_t>(ms)};
+            for (unsigned i = 0; i < fields.size(); ++i)
+                memory_.write16(at(a, i * 2), static_cast<std::uint16_t>(fields[i]));
+            result = 0;
             break;
         }
         case Api::CharPrevW:
